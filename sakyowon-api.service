@@ -1,0 +1,18 @@
+[Unit]
+Description=사교원 자체 서버 API (FastAPI/uvicorn)
+After=network.target
+
+[Service]
+Type=simple
+# 배포 위치에 맞게 경로를 조정하세요.
+WorkingDirectory=/opt/sakyowon/server
+EnvironmentFile=/etc/sakyowon-api.env
+ExecStart=/opt/sakyowon/server/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8787
+Restart=always
+RestartSec=3
+# 보안: 별도 시스템 계정(sakyowon)으로 실행 권장
+User=sakyowon
+Group=sakyowon
+
+[Install]
+WantedBy=multi-user.target

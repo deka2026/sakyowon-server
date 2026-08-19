@@ -1,0 +1,19 @@
+[Unit]
+Description=입찰메이트 (Next.js 서버형, 멀티테넌트)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/sakyowon/apps/bid-helper
+# 배포 전 1회: npm ci && npm run build (아래 start 는 next start -p 3200)
+ExecStart=/usr/bin/npm run start
+Environment=NODE_ENV=production
+# G2B 공공데이터 키 등은 이 파일에 (예: G2B_API_KEY=...)
+EnvironmentFile=-/etc/bid-helper.env
+Restart=always
+RestartSec=3
+User=sakyowon
+Group=sakyowon
+
+[Install]
+WantedBy=multi-user.target

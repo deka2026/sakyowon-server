@@ -1,0 +1,56 @@
+# 사교원 자체 서버 Caddy 설정 — /etc/caddy/Caddyfile
+#
+# 연대지능 공동위키(wiki.poomasi.org)를 제외한 모든 사이트를 이 서버에서 서빙한다.
+# 핵심: 정적은 파일로, 서버형(Next)은 포트로 프록시, /api/*는 자체 API로.
+# 같은 출처(sakyowon.co.kr)라 신청·문의에 CORS가 필요 없다.
+# Caddy가 Let's Encrypt 인증서를 자동 발급/갱신한다.
+#
+# 배치·이관 순서는 MIGRATION.md 참고.
+
+# ── 메인: 허브 + 정적 사이트들 + 자체 API ───────────────────────
+sakyowon.co.kr, www.sakyowon.co.kr {
+	encode gzip zstd
+
+	# 자체 API (신청·문의) → FastAPI
+	handle /api/* {
+		reverse_proxy 127.0.0.1:8787
+	}
+
+	# 정적 사이트 (허브=루트, 나머지는 하위 폴더)
+	#   /opt/sakyowon/www/{index.html, academy-site/, hometown-love/,
+	#                      mangnam-coop/, teamlearning-site/, sakyowon-wiki/}
+	handle {
+		root * /opt/sakyowon/www
+		try_files {path} {path}/ {path}/index.html
+		file_server
+	}
+}
+
+# ── 서버형 Next 앱: 망남 활력사이트 (SQLite) ─────────────────────
+# DNS: vitality.sakyowon.co.kr A → 서버 IP
+vitality.sakyowon.co.kr {
+	encode gzip zstd
+	reverse_proxy 127.0.0.1:3100
+}
+
+# ── 서버형 Next 앱: 입찰메이트 (멀티테넌트) ──────────────────────
+# DNS: bid.sakyowon.co.kr A → 서버 IP  (기존 bid.poomasi.org 대체)
+bid.sakyowon.co.kr {
+	encode gzip zstd
+	reverse_proxy 127.0.0.1:3200
+}
+
+# ── 사교원 본진 (sakyowon.poomasi.org 대체) ─────────────────────
+# DNS: home.sakyowon.co.kr A → 서버 IP
+# 본진 정적 파일 + /api(문의·AI)를 같은 출처로. AI는 SAKYOWON_ANTHROPIC_KEY 넣으면 활성.
+home.sakyowon.co.kr {
+	encode gzip zstd
+	handle /api/* {
+		reverse_proxy 127.0.0.1:8787
+	}
+	handle {
+		root * /opt/sakyowon/www-home
+		try_files {path} {path}/ {path}/index.html
+		file_server
+	}
+}
