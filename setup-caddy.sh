@@ -27,9 +27,10 @@ sakyowon.co.kr, www.sakyowon.co.kr {
 	}
 
 	# 정적 사이트 (허브=루트, 하위폴더=각 사이트)
+	# {path}.html: 위키(Quartz) 등 확장자 없는 내부링크를 GitHub Pages처럼 처리
 	handle {
 		root * /opt/sakyowon/www
-		try_files {path} {path}/ {path}/index.html
+		try_files {path} {path}.html {path}/ {path}/index.html
 		file_server
 	}
 }

@@ -21,7 +21,7 @@ sakyowon.co.kr, www.sakyowon.co.kr {
 	#                      mangnam-coop/, teamlearning-site/, sakyowon-wiki/}
 	handle {
 		root * /opt/sakyowon/www
-		try_files {path} {path}/ {path}/index.html
+		try_files {path} {path}.html {path}/ {path}/index.html
 		file_server
 	}
 }
@@ -50,7 +50,7 @@ home.sakyowon.co.kr {
 	}
 	handle {
 		root * /opt/sakyowon/www-home
-		try_files {path} {path}/ {path}/index.html
+		try_files {path} {path}.html {path}/ {path}/index.html
 		file_server
 	}
 }
