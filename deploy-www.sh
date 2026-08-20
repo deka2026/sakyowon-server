@@ -16,7 +16,10 @@ hometown-love main hometown-love
 academy-site main academy-site
 teamlearning-site main teamlearning-site
 sakyowon-wiki-site master sakyowon-wiki
+mangnam-vitality gh-pages mangnam-vitality
 "
+# mangnam-vitality는 정적 '홍보판'(gh-pages). 관리자·DB가 있는 서버형 본편은
+# vitality.sakyowon.co.kr (setup-apps.sh) 로 별도 운영한다.
 
 echo "$SITES" | while read -r repo branch target; do
   [ -z "${repo:-}" ] && continue
