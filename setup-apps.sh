@@ -6,12 +6,14 @@ set -euo pipefail
 APPS=/opt/sakyowon/apps
 APP=$APPS/mangnam-vitality
 
-echo "[1/5] Node.js 20 LTS 설치"
+echo "[1/5] Node.js 20 LTS + 빌드도구 설치"
 if ! command -v node >/dev/null 2>&1; then
   curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null
   apt -y install nodejs >/dev/null
 fi
-echo "    -> node $(node --version) / npm $(npm --version)"
+# better-sqlite3 같은 네이티브 모듈 컴파일에 필요
+command -v gcc >/dev/null 2>&1 || apt -y install build-essential >/dev/null
+echo "    -> node $(node --version) / npm $(npm --version) / gcc $(gcc --version | head -1 | awk '{print $NF}')"
 
 echo "[2/5] 앱 코드 내려받기/갱신"
 if [ -d "$APP/.git" ]; then
@@ -23,8 +25,9 @@ fi
 
 echo "[3/5] 의존성 설치 + 빌드 (수 분 소요)"
 cd "$APP"
-npm ci --no-audit --no-fund 2>&1 | tail -1
-npm run build 2>&1 | tail -3
+# 실패 시 원인이 보이도록 에러는 마지막 20줄까지 출력한다
+npm ci --no-audit --no-fund 2>&1 | tail -20
+npm run build 2>&1 | tail -5
 mkdir -p "$APP/data"   # DB 폴더 (지미 스냅샷 오면 data/app.db 교체)
 
 echo "[4/5] systemd 서비스 등록"
