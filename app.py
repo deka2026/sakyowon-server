@@ -345,6 +345,22 @@ def _record_fail(ip: str):
     _login_fails.setdefault(ip, []).append(time.time())
 
 
+# 공개 접수(신청·문의·피드백) 스팸 방지 — IP당 분당 횟수 제한
+_post_hits: dict = {}
+
+
+def post_limited(request: Request, limit: int = 10) -> bool:
+    ip = _client_ip(request)
+    now = time.time()
+    hits = [t for t in _post_hits.get(ip, []) if now - t < 60]
+    if len(hits) >= limit:
+        _post_hits[ip] = hits
+        return True
+    hits.append(now)
+    _post_hits[ip] = hits
+    return False
+
+
 def err(code: str, status: int):
     return JSONResponse({"ok": False, "error": code}, status_code=status)
 
@@ -557,6 +573,8 @@ def health():
 
 @app.post("/api/applications")
 async def create_application(request: Request):
+    if post_limited(request):
+        return JSONResponse({"ok": False, "error": "요청이 너무 잦습니다. 잠시 후 다시 시도해 주세요."}, status_code=429)
     body = await read_json(request)
     name = s(body.get("name"))
     phone = s(body.get("phone"))
@@ -637,6 +655,8 @@ def export_applications(request: Request, key: str = Query("")):
 
 @app.post("/api/inquiries")
 async def create_inquiry(request: Request):
+    if post_limited(request):
+        return JSONResponse({"ok": False, "error": "요청이 너무 잦습니다. 잠시 후 다시 시도해 주세요."}, status_code=429)
     body = await read_json(request)
     name = s(body.get("name"))
     message = s(body.get("message"))
@@ -671,6 +691,8 @@ def list_inquiries(request: Request, key: str = Query("")):
 
 @app.post("/api/feedback")
 async def create_feedback(request: Request):
+    if post_limited(request):
+        return JSONResponse({"ok": False, "error": "요청이 너무 잦습니다. 잠시 후 다시 시도해 주세요."}, status_code=429)
     body = await read_json(request)
     row_id = s(body.get("id")) or new_id("FB")
     with db() as conn:

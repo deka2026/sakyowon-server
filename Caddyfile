@@ -11,6 +11,14 @@
 sakyowon.co.kr, www.sakyowon.co.kr {
 	encode gzip zstd
 
+	# 보안 헤더
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		Referrer-Policy "strict-origin-when-cross-origin"
+	}
+
 	# 자체 API (신청·문의) → FastAPI
 	handle /api/* {
 		reverse_proxy 127.0.0.1:8787
