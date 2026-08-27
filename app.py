@@ -172,10 +172,47 @@ def init_db():
             )
             """
         )
-        # 기존 feedback 테이블에 통합 관리자 화면용 컬럼 보강 (있으면 조용히 통과)
-        for col in ("msg_ko", "page", "contact", "user_lang", "reply"):
+        # 햇소자 실데이터: 마을(조합) + 회원 생성 문서
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS villages (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                name        TEXT NOT NULL,
+                region      TEXT,
+                members     INTEGER DEFAULT 0,
+                capacity    TEXT,
+                progress    INTEGER DEFAULT 0,
+                phase       TEXT DEFAULT '사전 검토',
+                deadline    TEXT,
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS documents (
+                id          TEXT PRIMARY KEY,
+                user_id     INTEGER NOT NULL,
+                village_id  INTEGER,
+                title       TEXT NOT NULL,
+                type        TEXT,
+                status      TEXT DEFAULT '완료',
+                content     TEXT,
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT
+            )
+            """
+        )
+        # 기존 테이블 컬럼 보강 (있으면 조용히 통과)
+        for table, col, decl in (
+            ("feedback", "msg_ko", "TEXT"), ("feedback", "page", "TEXT"),
+            ("feedback", "contact", "TEXT"), ("feedback", "user_lang", "TEXT"),
+            ("feedback", "reply", "TEXT"),
+            ("users", "village_id", "INTEGER"),
+        ):
             try:
-                conn.execute(f"ALTER TABLE feedback ADD COLUMN {col} TEXT")
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
             except sqlite3.OperationalError:
                 pass
 
@@ -471,7 +508,7 @@ def admin_members(request: Request, status: str = Query("")):
     u, e = require_staff(request)
     if e:
         return e
-    sql = "SELECT id, username, name, contact, org, role, status, memo, applied_at FROM users"
+    sql = "SELECT id, username, name, contact, org, role, status, memo, applied_at, village_id FROM users"
     args = []
     if status:
         sql += " WHERE status = ?"
@@ -509,6 +546,8 @@ async def admin_member_update(member_id: int, request: Request):
             sets.append("role = ?"); args.append(role)
         if "memo" in body:
             sets.append("memo = ?"); args.append(s(body.get("memo")))
+        if "village_id" in body:
+            sets.append("village_id = ?"); args.append(body.get("village_id") or None)
         args.append(member_id)
         conn.execute(f"UPDATE users SET {', '.join(sets)} WHERE id = ?", args)
         if status in ("pending", "rejected"):
@@ -715,6 +754,170 @@ def list_feedback(request: Request, key: str = Query("")):
     with db() as conn:
         rows = [dict(r) for r in conn.execute("SELECT * FROM feedback ORDER BY created_at DESC").fetchall()]
     return {"ok": True, "rows": rows}
+
+
+# ─────────────── 햇소자 실데이터: 마을(조합) · 생성 문서 ───────────────
+# 마을 등록·수정은 운영진(admin·staff), 열람은 승인된 회원 전체(연합체 현황판의 투명성 취지).
+# 문서는 본인 것만 읽고 쓴다. 운영진은 마을별 자료실로 열람.
+
+VILLAGE_FIELDS = ("name", "region", "members", "capacity", "progress", "phase", "deadline")
+
+
+def require_member(request: Request):
+    u = current_user(request)
+    if not u:
+        return None, err("unauthorized", 401)
+    return u, None
+
+
+def village_row(r) -> dict:
+    return {k: r[k] for k in ("id", "created_at", "updated_at", *VILLAGE_FIELDS)}
+
+
+@app.get("/api/villages")
+def list_villages(request: Request):
+    u, e = require_member(request)
+    if e:
+        return e
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM villages ORDER BY created_at").fetchall()
+    return {"ok": True, "items": [village_row(r) for r in rows], "my_village_id": u["village_id"]}
+
+
+@app.post("/api/villages")
+async def create_village(request: Request):
+    u, e = require_staff(request)
+    if e:
+        return e
+    body = await read_json(request)
+    if not s(body.get("name")):
+        return err("bad_request", 400)
+    with db() as conn:
+        cur = conn.execute(
+            "INSERT INTO villages (name, region, members, capacity, progress, phase, deadline, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (s(body.get("name")), s(body.get("region")), int(body.get("members") or 0),
+             s(body.get("capacity")), int(body.get("progress") or 0),
+             s(body.get("phase")) or "사전 검토", s(body.get("deadline")) or "미정", now_iso()),
+        )
+        vid = cur.lastrowid
+    return {"ok": True, "id": vid}
+
+
+@app.patch("/api/villages/{vid}")
+async def update_village(vid: int, request: Request):
+    u, e = require_staff(request)
+    if e:
+        return e
+    body = await read_json(request)
+    sets, args = ["updated_at = ?"], [now_iso()]
+    for f in VILLAGE_FIELDS:
+        if f in body:
+            val = body[f]
+            if f in ("members", "progress"):
+                val = int(val or 0)
+            else:
+                val = s(val)
+            sets.append(f"{f} = ?"); args.append(val)
+    with db() as conn:
+        target = conn.execute("SELECT id FROM villages WHERE id = ?", (vid,)).fetchone()
+        if target is None:
+            return err("not_found", 404)
+        args.append(vid)
+        conn.execute(f"UPDATE villages SET {', '.join(sets)} WHERE id = ?", args)
+    return {"ok": True}
+
+
+@app.delete("/api/villages/{vid}")
+def delete_village(vid: int, request: Request):
+    u = current_user(request)
+    if not u:
+        return err("unauthorized", 401)
+    if u["role"] != "admin":
+        return err("forbidden", 403)  # 마을 삭제는 이사장(admin)만
+    with db() as conn:
+        target = conn.execute("SELECT id FROM villages WHERE id = ?", (vid,)).fetchone()
+        if target is None:
+            return err("not_found", 404)
+        conn.execute("DELETE FROM villages WHERE id = ?", (vid,))
+        conn.execute("UPDATE users SET village_id = NULL WHERE village_id = ?", (vid,))
+    return {"ok": True}
+
+
+@app.get("/api/my/village")
+def my_village(request: Request):
+    u, e = require_member(request)
+    if e:
+        return e
+    if not u["village_id"]:
+        return {"ok": True, "village": None}
+    with db() as conn:
+        r = conn.execute("SELECT * FROM villages WHERE id = ?", (u["village_id"],)).fetchone()
+    return {"ok": True, "village": village_row(r) if r else None}
+
+
+@app.get("/api/my/documents")
+def my_documents(request: Request):
+    u, e = require_member(request)
+    if e:
+        return e
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM documents WHERE user_id = ? ORDER BY created_at DESC", (u["id"],)
+        ).fetchall()
+    return {"ok": True, "items": [dict(r) for r in rows]}
+
+
+@app.post("/api/my/documents")
+async def save_document(request: Request):
+    u, e = require_member(request)
+    if e:
+        return e
+    body = await read_json(request)
+    title = s(body.get("title"))
+    if not title:
+        return err("bad_request", 400)
+    doc_id = s(body.get("id")) or new_id("DOC")
+    with db() as conn:
+        # 같은 id가 내 문서면 갱신, 아니면 신규
+        mine = conn.execute("SELECT user_id FROM documents WHERE id = ?", (doc_id,)).fetchone()
+        if mine and mine["user_id"] != u["id"] and u["role"] not in ("admin", "staff"):
+            return err("forbidden", 403)
+        conn.execute(
+            "INSERT OR REPLACE INTO documents (id, user_id, village_id, title, type, status, content, created_at, updated_at)"
+            " VALUES (?,?,?,?,?,?,?,COALESCE((SELECT created_at FROM documents WHERE id = ?), ?),?)",
+            (doc_id, mine["user_id"] if mine else u["id"], body.get("village_id") or u["village_id"],
+             title, s(body.get("type")) or "문서", s(body.get("status")) or "완료",
+             body.get("content") or "", doc_id, now_iso(), now_iso()),
+        )
+    return {"ok": True, "id": doc_id}
+
+
+@app.delete("/api/my/documents/{doc_id}")
+def delete_document(doc_id: str, request: Request):
+    u, e = require_member(request)
+    if e:
+        return e
+    with db() as conn:
+        row = conn.execute("SELECT user_id FROM documents WHERE id = ?", (doc_id,)).fetchone()
+        if row is None:
+            return err("not_found", 404)
+        if row["user_id"] != u["id"] and u["role"] not in ("admin", "staff"):
+            return err("forbidden", 403)
+        conn.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
+    return {"ok": True}
+
+
+@app.get("/api/villages/{vid}/documents")
+def village_documents(vid: int, request: Request):
+    u, e = require_staff(request)
+    if e:
+        return e
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM documents WHERE village_id = ? ORDER BY created_at DESC", (vid,)
+        ).fetchall()
+    return {"ok": True, "items": [dict(r) for r in rows]}
 
 
 # ─────────────────── AI (본진 기능 재구현) ───────────────────
