@@ -48,6 +48,16 @@ bid.sakyowon.co.kr {
 	reverse_proxy 127.0.0.1:3200
 }
 
+# ── 시민재생에너지 AI 메인페이지 (정적, cre.sakyowon.co.kr) ──────
+# DNS: cre A → 서버 IP (아직 미등록 — 가비아 콘솔에서 추가 필요)
+# 콘텐츠는 허브 레포(deka2026.github.io)의 cre/ 폴더, deploy-www.sh가
+# 허브를 통째로 복사할 때 /opt/sakyowon/www/cre 에 함께 배치된다.
+cre.sakyowon.co.kr {
+	encode gzip zstd
+	root * /opt/sakyowon/www/cre
+	file_server
+}
+
 # ── 사교원 본진 (sakyowon.poomasi.org 대체) ─────────────────────
 # DNS: home.sakyowon.co.kr A → 서버 IP
 # 본진 정적 파일 + /api(문의·AI)를 같은 출처로. AI는 SAKYOWON_ANTHROPIC_KEY 넣으면 활성.
