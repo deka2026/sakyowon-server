@@ -19,6 +19,13 @@ sakyowon.co.kr, www.sakyowon.co.kr {
 		Referrer-Policy "strict-origin-when-cross-origin"
 	}
 
+	# 페이지(HTML·확장자 없는 경로·폴더)는 항상 재검증 — 배포 즉시 새 버전 반영.
+	# (Cache-Control이 없으면 브라우저가 임의로 캐시해 옛 화면이 뜬다. no-cache는
+	#  "저장은 하되 매번 서버에 확인" — 안 바뀐 파일은 304라 부하 증가는 미미)
+	# 정적 자원(js·css·이미지·폰트 등)은 기존 동작 그대로.
+	@page not path *.js *.css *.mjs *.png *.jpg *.jpeg *.gif *.webp *.svg *.ico *.woff *.woff2 *.ttf *.otf *.mp4 *.webm *.pdf *.zip *.csv *.xlsx *.hwp *.hwpx *.docx
+	header @page Cache-Control "no-cache"
+
 	# 자체 API (신청·문의) → FastAPI
 	handle /api/* {
 		reverse_proxy 127.0.0.1:8787
@@ -54,6 +61,8 @@ bid.sakyowon.co.kr {
 # 허브를 통째로 복사할 때 /opt/sakyowon/www/cre 에 함께 배치된다.
 cre.sakyowon.co.kr {
 	encode gzip zstd
+	@page not path *.js *.css *.mjs *.png *.jpg *.jpeg *.gif *.webp *.svg *.ico *.woff *.woff2 *.ttf *.otf *.mp4 *.webm *.pdf *.zip *.csv *.xlsx *.hwp *.hwpx *.docx
+	header @page Cache-Control "no-cache"
 	root * /opt/sakyowon/www/cre
 	file_server
 }
@@ -63,6 +72,8 @@ cre.sakyowon.co.kr {
 # 본진 정적 파일 + /api(문의·AI)를 같은 출처로. AI는 SAKYOWON_ANTHROPIC_KEY 넣으면 활성.
 home.sakyowon.co.kr {
 	encode gzip zstd
+	@page not path *.js *.css *.mjs *.png *.jpg *.jpeg *.gif *.webp *.svg *.ico *.woff *.woff2 *.ttf *.otf *.mp4 *.webm *.pdf *.zip *.csv *.xlsx *.hwp *.hwpx *.docx
+	header @page Cache-Control "no-cache"
 	handle /api/* {
 		reverse_proxy 127.0.0.1:8787
 	}
