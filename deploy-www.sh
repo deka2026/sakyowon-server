@@ -12,6 +12,7 @@ trap 'rm -rf "$TMP"' EXIT
 SITES="
 deka2026.github.io main .
 mangnam-coop gh-pages mangnam-coop
+mangnam-site main mangnam-site
 hometown-love main hometown-love
 academy-site main academy-site
 teamlearning-site main teamlearning-site
