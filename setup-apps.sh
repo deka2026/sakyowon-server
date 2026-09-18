@@ -3,6 +3,11 @@
 # 사용법: bash /opt/sakyowon/src/setup-apps.sh   (root, 여러 번 실행해도 안전)
 set -euo pipefail
 
+# root 셸이 nvm 등으로 다른 node를 쓰면, npm ci 가 네이티브 모듈(better-sqlite3)을
+# 그 버전으로 빌드해버려 /usr/bin/node 로 도는 서비스가 다음 재시작 때 죽는다
+# (ERR_DLOPEN_FAILED: NODE_MODULE_VERSION 불일치). 서비스가 쓰는 경로로 고정한다.
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+
 APPS=/opt/sakyowon/apps
 APP=$APPS/mangnam-vitality
 
