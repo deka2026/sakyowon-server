@@ -43,6 +43,7 @@ import hmac
 import io
 import json
 import os
+import re
 import secrets
 import sqlite3
 import time
@@ -69,6 +70,15 @@ AI_MODEL = os.environ.get("SAKYOWON_AI_MODEL", "claude-sonnet-5")
 AI_MODEL_FAST = os.environ.get("SAKYOWON_AI_MODEL_FAST", "claude-haiku-4-5-20251001")
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
+
+# 품에 엔진(HPC·EXAONE) 서버 간 API — 「햇소자 ↔ 품에 엔진 연동 규격서」 6절.
+# POOME_API_BASE 가 비어 있으면 아래 라우팅은 전부 꺼지고 기존 Anthropic 경로 그대로다.
+# 규격서 4-6: 엔진 503/504 때 Anthropic 으로 조용히 폴백하지 않는다 — 실적 집계가 어긋난다.
+POOME_API_BASE = os.environ.get("POOME_API_BASE", "").rstrip("/")
+POOME_API_KEY = os.environ.get("POOME_API_KEY", "")
+POOME_TIMEOUT = int(os.environ.get("POOME_TIMEOUT", "100") or "100")  # 규격 회신(9/2): 504 임계 90~110s
+# 규격서 v0.2 4-3 법령 topic 8종. 목록 밖 값은 보내지 않는다.
+POOME_TOPICS = ("setback", "permit", "devact", "agri", "coop", "elec", "land", "resc")
 
 app = FastAPI(title="사교원 자체 서버 API", docs_url=None, redoc_url=None)
 
@@ -210,11 +220,28 @@ def init_db():
             ("feedback", "contact", "TEXT"), ("feedback", "user_lang", "TEXT"),
             ("feedback", "reply", "TEXT"),
             ("users", "village_id", "INTEGER"),
+            ("villages", "ref", "TEXT"),   # 엔진 집계용 불변 익명키 V-xxxx (규격서 v0.2 5절)
         ):
             try:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
             except sqlite3.OperationalError:
                 pass
+        # villages.ref 백필 — 한 번 부여하면 고정. id에서 매번 파생하지 않는다(규격서 v0.2 5절).
+        try:
+            rows = conn.execute(
+                "SELECT id FROM villages WHERE ref IS NULL OR ref = '' ORDER BY id"
+            ).fetchall()
+            if rows:
+                used = conn.execute(
+                    "SELECT ref FROM villages WHERE ref LIKE 'V-%'"
+                ).fetchall()
+                nums = [int(r[0][2:]) for r in used if r[0] and r[0][2:].isdigit()]
+                nxt = (max(nums) + 1) if nums else 1
+                for r in rows:
+                    conn.execute("UPDATE villages SET ref = ? WHERE id = ?", (f"V-{nxt:04d}", r[0]))
+                    nxt += 1
+        except sqlite3.OperationalError:
+            pass
 
 
 init_db()
@@ -771,7 +798,100 @@ def require_member(request: Request):
 
 
 def village_row(r) -> dict:
-    return {k: r[k] for k in ("id", "created_at", "updated_at", *VILLAGE_FIELDS)}
+    d = {k: r[k] for k in ("id", "created_at", "updated_at", *VILLAGE_FIELDS)}
+    try:
+        d["ref"] = r["ref"]
+    except (IndexError, KeyError):
+        d["ref"] = None
+    return d
+
+
+# ── 엔진 연동용 마을 표현 (규격서 v0.2 5절) ─────────────────────────────
+# 엔진에는 ref·sido·sigungu·capacity_kw 만 간다. 마을 실명·주소·주민 정보는 보내지 않는다.
+
+def next_village_ref(conn) -> str:
+    """V-0001 부터 한 칸씩. 최초 부여 후 고정이라 재사용·재계산하지 않는다."""
+    used = conn.execute("SELECT ref FROM villages WHERE ref LIKE 'V-%'").fetchall()
+    nums = [int(r[0][2:]) for r in used if r[0] and r[0][2:].isdigit()]
+    return f"V-{(max(nums) + 1) if nums else 1:04d}"
+
+
+_SIDO_FULL = {
+    "서울": "서울특별시", "부산": "부산광역시", "대구": "대구광역시", "인천": "인천광역시",
+    "광주": "광주광역시", "대전": "대전광역시", "울산": "울산광역시", "세종": "세종특별자치시",
+    "경기": "경기도", "강원": "강원특별자치도", "충북": "충청북도", "충남": "충청남도",
+    "전북": "전북특별자치도", "전남": "전라남도", "경북": "경상북도", "경남": "경상남도",
+    "제주": "제주특별자치도",
+}
+
+
+def parse_sido_sigungu(region: str):
+    """'전남 완도군' · '전라남도 완도군 신지면' → ('전라남도', '완도군'). 못 가르면 (원문, '')."""
+    t = (region or "").strip().split()
+    if not t:
+        return "", ""
+    head = t[0]
+    sido = _SIDO_FULL.get(head, head)
+    if head not in _SIDO_FULL:
+        for short, full in _SIDO_FULL.items():
+            if head.startswith(short):
+                sido = full
+                break
+    sigungu = t[1] if len(t) > 1 else ""
+    return sido, sigungu
+
+
+def parse_capacity_kw(capacity) -> int:
+    """'500kW' · '1MW' · '0.5 MW' · 500 → kW 정수. 못 읽으면 0."""
+    if isinstance(capacity, (int, float)):
+        return int(capacity)
+    txt = (capacity or "").strip().replace(",", "")
+    if not txt:
+        return 0
+    num = ""
+    for ch in txt:
+        if ch.isdigit() or (ch == "." and "." not in num):
+            num += ch
+        elif num:
+            break
+    if not num:
+        return 0
+    try:
+        val = float(num)
+    except ValueError:
+        return 0
+    low = txt.lower()
+    if "mw" in low:
+        val *= 1000
+    elif "gw" in low:
+        val *= 1000000
+    return int(round(val))
+
+
+def village_engine_context(r) -> dict:
+    """엔진 요청의 context/village 에 넣을 값. name 은 일부러 넣지 않는다."""
+    if r is None:
+        return {}
+    d = village_row(r)
+    sido, sigungu = parse_sido_sigungu(d.get("region") or "")
+    out = {"ref": d.get("ref") or ""}
+    if sido:
+        out["sido"] = sido
+    if sigungu:
+        out["sigungu"] = sigungu
+    kw = parse_capacity_kw(d.get("capacity"))
+    if kw:
+        out["capacity_kw"] = kw
+    return out
+
+
+def village_ref_of_user(u) -> str:
+    """로그인 사용자의 배정 마을 ref. 프런트가 보낸 값을 믿지 않고 서버에서 조회한다."""
+    if not u or not u.get("village_id"):
+        return ""
+    with db() as conn:
+        r = conn.execute("SELECT * FROM villages WHERE id = ?", (u["village_id"],)).fetchone()
+    return (village_engine_context(r) or {}).get("ref", "")
 
 
 @app.get("/api/villages")
@@ -793,15 +913,16 @@ async def create_village(request: Request):
     if not s(body.get("name")):
         return err("bad_request", 400)
     with db() as conn:
+        ref = next_village_ref(conn)
         cur = conn.execute(
-            "INSERT INTO villages (name, region, members, capacity, progress, phase, deadline, created_at)"
-            " VALUES (?,?,?,?,?,?,?,?)",
+            "INSERT INTO villages (name, region, members, capacity, progress, phase, deadline, created_at, ref)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
             (s(body.get("name")), s(body.get("region")), int(body.get("members") or 0),
              s(body.get("capacity")), int(body.get("progress") or 0),
-             s(body.get("phase")) or "사전 검토", s(body.get("deadline")) or "미정", now_iso()),
+             s(body.get("phase")) or "사전 검토", s(body.get("deadline")) or "미정", now_iso(), ref),
         )
         vid = cur.lastrowid
-    return {"ok": True, "id": vid}
+    return {"ok": True, "id": vid, "ref": ref}
 
 
 @app.patch("/api/villages/{vid}")
@@ -981,6 +1102,63 @@ def _anthropic_text(data_bytes: bytes) -> str:
     return ""
 
 
+# ─────────────────── 품에 엔진 어댑터 (규격서 v0.1 4절) ───────────────────
+# 프런트는 그대로 /api/ai/chat 을 부른다. 서버 안쪽에서만 엔진으로 갈아탄다.
+# 응답에는 항상 backend 를 붙여 어느 엔진의 답인지 사후에 가릴 수 있게 한다.
+
+def _poome_request(path: str, body: dict | None = None, timeout: int | None = None):
+    """엔진 /api/v1/* 호출 → (status, dict). 네트워크 실패는 status 0."""
+    url = f"{POOME_API_BASE}{path}"
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "X-API-Key": POOME_API_KEY,
+            "Content-Type": "application/json",
+            "User-Agent": "sakyowon-hatsoja/1.0",
+        },
+        method="POST" if data is not None else "GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout or POOME_TIMEOUT) as r:
+            raw = r.read()
+            status = r.status
+    except urllib.error.HTTPError as e:
+        raw, status = e.read(), e.code
+    except Exception as e:  # DNS·타임아웃·터널 다운(Cloudflare 530 등)
+        return 0, {"error": {"code": "unreachable", "message": str(e)[:200]}}
+    try:
+        return status, json.loads(raw or b"{}")
+    except Exception:
+        return status, {"error": {"code": "bad_json", "message": raw[:200].decode("utf-8", "ignore")}}
+
+
+def _poome_unavailable_answer(status: int, d: dict) -> dict:
+    """503/504/0 — 폴백 금지. 사용자에게 잠시 후 안내 + backend 표시 (규격서 4-6)."""
+    msg = (d.get("error") or {}).get("message", "")
+    if status == 429:
+        text = "AI 엔진 호출 한도에 잠시 걸렸습니다. 1분 뒤 다시 시도해 주세요."
+    elif status in (503, 504, 0):
+        text = "AI 엔진이 잠시 응답하지 않습니다. 잠시 후 다시 시도해 주세요."
+    elif status == 401:
+        text = "AI 엔진 인증에 실패했습니다. 관리자에게 알려 주세요."
+    else:
+        text = "AI 엔진이 오류를 돌려주었습니다. 잠시 후 다시 시도해 주세요."
+    return {"answer": text, "backend": "poome", "engine_status": status, "engine_error": msg[:200]}
+
+
+@app.get("/api/ai/health")
+async def ai_health():
+    """연동 ①단계용 — 사교원 서버에서 엔진 health 왕복. 인증 불필요(규격서 4-2)."""
+    if not POOME_API_BASE:
+        return {"ok": False, "backend": "anthropic" if ANTHROPIC_KEY else "none",
+                "engine": "not_configured"}
+    status, d = await run_in_threadpool(_poome_request, "/api/v1/health", None, 10)
+    return {"ok": status == 200 and bool(d.get("ok")), "backend": "poome",
+            "engine_status": status, "engine": d}
+
+
 @app.post("/api/ai")
 async def ai_proxy(request: Request):
     body = await read_json(request)
@@ -1010,12 +1188,60 @@ async def ai_proxy(request: Request):
 @app.post("/api/ai/chat")
 async def ai_chat(request: Request):
     body = await read_json(request)
-    prob = anthropic_key_problem()
-    if prob:
-        return {"answer": f"AI 기능이 아직 연결되지 않았습니다. (서버 SAKYOWON_ANTHROPIC_KEY — {prob})"}
     prompt = s(body.get("prompt"))
     context = s(body.get("context"))
     history = body.get("history") if isinstance(body.get("history"), list) else []
+
+    # ── 엔진 경로 (규격서 v0.2 4-3 /api/v1/ask) — POOME_API_BASE 설정 시 우선 ──
+    if POOME_API_BASE:
+        ask = {"question": prompt or "(빈 질문)", "max_chars": 2000}
+        ctx = {}
+        # stage 는 짧은 단계명이다(규격 예: "신청준비"). 상담 탭이 보내는 context 는
+        # 긴 설명문이라 그대로 넣지 않고, 그 안의 화면 이름만 뽑아 쓴다.
+        stage = s(body.get("stage"))
+        if not stage and context:
+            m = re.search(r"직전에 보던 화면:\s*([^)]{1,40})", context)
+            if m:
+                stage = m.group(1).strip()
+        if stage:
+            ctx["stage"] = stage[:40]
+        # 법령 topic 8종(v0.2). 상담 탭은 보내지 않는다 — 온 값만 검증해 넘긴다.
+        topic = s(body.get("topic"))
+        if topic in POOME_TOPICS:
+            ctx["topic"] = topic
+        # 마을 익명키는 서버에서 조회한다. 프런트가 보낸 값은 쓰지 않는다(실명 유출·위조 방지).
+        vref = village_ref_of_user(current_user(request))
+        if vref:
+            ctx["village_ref"] = vref
+        if ctx:
+            ask["context"] = ctx
+        # 최근 10턴만. 역할·본문만 남기고 나머지 필드는 떨군다(v0.2 4-3).
+        hist = []
+        for h in history[-10:]:
+            if not isinstance(h, dict):
+                continue
+            role = s(h.get("role"))
+            content = s(h.get("content"))
+            if role in ("user", "assistant") and content:
+                hist.append({"role": role, "content": content[:4000]})
+        if hist:
+            ask["history"] = hist
+        status, d = await run_in_threadpool(_poome_request, "/api/v1/ask", ask)
+        if status != 200 or "answer" not in d:
+            return _poome_unavailable_answer(status, d)
+        if d.get("insufficient"):
+            return {"answer": "근거 자료에서 답을 찾지 못했습니다. 질문을 바꾸어 보시거나 상담신청을 이용해 주세요.",
+                    "backend": d.get("backend", "poome"), "insufficient": True,
+                    "sources": d.get("sources", []), "request_id": d.get("request_id")}
+        return {"answer": d.get("answer", ""), "backend": d.get("backend", "poome"),
+                "sources": d.get("sources", []), "insufficient": False,
+                "request_id": d.get("request_id"), "elapsed_ms": d.get("elapsed_ms")}
+
+    # ── 기존 Anthropic 경로 (엔진 미설정 시) ──
+    prob = anthropic_key_problem()
+    if prob:
+        return {"answer": f"AI 기능이 아직 연결되지 않았습니다. (서버 SAKYOWON_ANTHROPIC_KEY — {prob})",
+                "backend": "none"}
     messages = []
     for h in history[-10:]:
         role = s(h.get("role"))
@@ -1034,11 +1260,13 @@ async def ai_chat(request: Request):
     answer = _anthropic_text(data)
     if not answer:
         if status == 0:
-            return {"answer": "(AI 서버에 연결하지 못했습니다. 키 설정과 네트워크를 확인해 주세요.)"}
+            return {"answer": "(AI 서버에 연결하지 못했습니다. 키 설정과 네트워크를 확인해 주세요.)",
+                    "backend": "anthropic"}
         if status == 401:
-            return {"answer": "(AI 키가 거부되었습니다. SAKYOWON_ANTHROPIC_KEY 값을 확인해 주세요.)"}
-        return {"answer": "(응답을 생성하지 못했습니다. 잠시 후 다시 시도해 주세요.)"}
-    return {"answer": answer}
+            return {"answer": "(AI 키가 거부되었습니다. SAKYOWON_ANTHROPIC_KEY 값을 확인해 주세요.)",
+                    "backend": "anthropic"}
+        return {"answer": "(응답을 생성하지 못했습니다. 잠시 후 다시 시도해 주세요.)", "backend": "anthropic"}
+    return {"answer": answer, "backend": "anthropic"}
 
 
 @app.post("/api/translate")
