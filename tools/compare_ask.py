@@ -113,7 +113,9 @@ def ask_engine(base, key, question, topic):
 
 
 def ask_anthropic(key, model, question):
-    body = {"model": model, "max_tokens": 1500, "system": CHAT_SYSTEM,
+    # thinking을 끄지 않으면 Sonnet 5가 생각에 토큰을 다 쓰고 빈 답을 낸다(9/23 1차 실행: 4건 빈 답, 2건 잘림).
+    # 햇소자 상담 탭(app.py /api/ai/chat)과 같은 설정으로 맞춘다.
+    body = {"model": model, "max_tokens": 2500, "thinking": {"type": "disabled"}, "system": CHAT_SYSTEM,
             "messages": [{"role": "user", "content": question}]}
     status, d, _, ms = post_json(ANTHROPIC_URL, body, {"x-api-key": key, "anthropic-version": ANTHROPIC_VERSION}, 120)
     text = ""

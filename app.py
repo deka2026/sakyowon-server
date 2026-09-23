@@ -1167,6 +1167,9 @@ async def ai_proxy(request: Request):
         return JSONResponse({"error": {"message": f"AI 키(SAKYOWON_ANTHROPIC_KEY) 문제: {prob}"}})
     if AI_MODEL:
         body["model"] = AI_MODEL  # 클라이언트가 보낸 옛 모델 ID를 현재 모델로 통일
+    # 프런트(서류 생성·검토)는 max_tokens 1500~3000만 보낸다. Sonnet 5 기본 thinking이 그 예산을 먼저 쓰면
+    # 본문이 비거나 잘리므로, 클라이언트가 명시하지 않았을 때만 생각을 끈다(9/23 대조 시험에서 확인).
+    body.setdefault("thinking", {"type": "disabled"})
 
     if body.get("stream"):
         def gen():
@@ -1255,7 +1258,10 @@ async def ai_chat(request: Request):
         "정확하고 신뢰감 있게, 한국어로 간결히 답합니다."
         + (f" 현재 화면 컨텍스트: {context}." if context else "")
     )
-    areq = {"model": AI_MODEL, "max_tokens": 1500, "system": system, "messages": messages}
+    # Sonnet 5는 thinking이 기본으로 켜져 있어 max_tokens를 생각에 다 쓰고 빈 답을 낸다(9/23 대조 시험 15건 중 4건).
+    # 상담 답변은 짧은 단발이라 생각을 끄고 본문 여유를 준다.
+    areq = {"model": AI_MODEL, "max_tokens": 2500, "thinking": {"type": "disabled"},
+            "system": system, "messages": messages}
     status, data = await run_in_threadpool(_anthropic_once, areq)
     answer = _anthropic_text(data)
     if not answer:
