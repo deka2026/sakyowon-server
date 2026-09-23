@@ -926,6 +926,19 @@ def village_documents(vid: int, request: Request):
 # /api/translate: 한국어 번역 → {translated}
 # 키는 SAKYOWON_ANTHROPIC_KEY 환경변수로만 주입한다(코드/깃에 없음).
 
+def anthropic_key_problem() -> str:
+    """키가 쓸 수 없는 상태면 그 이유를 한 줄로, 쓸 수 있으면 빈 문자열.
+    HTTP 헤더는 latin-1 로만 인코딩된다 — 값에 한글이 섞이면 호출이 예외로 죽는다.
+    환경파일에 안내문의 자리표시자(sk-ant-여기에-키 등)를 그대로 넣은 사고가 실제로 있었다."""
+    if not ANTHROPIC_KEY:
+        return "미설정"
+    if not ANTHROPIC_KEY.isascii():
+        return "키 값에 한글 등 ASCII 밖 문자가 들어 있습니다 (자리표시자를 그대로 넣지 않았는지 확인)"
+    if not ANTHROPIC_KEY.startswith("sk-"):
+        return "키 형식이 아닙니다 (sk- 로 시작해야 합니다)"
+    return ""
+
+
 def _anthropic_request(body: dict):
     """Anthropic 메시지 API에 요청을 보내고 열린 응답 객체를 돌려준다(스트리밍 지원).
     HTTP 4xx/5xx는 urllib이 HTTPError를 던지지만 그 객체도 .read()/status 가 있어 그대로 relay 가능."""
@@ -947,10 +960,14 @@ def _anthropic_request(body: dict):
 
 
 def _anthropic_once(body: dict):
-    """비스트리밍 호출 → (status_code, response_bytes). 응답은 Anthropic 원문 그대로."""
-    resp, status = _anthropic_request({**body, "stream": False})
-    data = resp.read()
-    return status, data
+    """비스트리밍 호출 → (status_code, response_bytes). 응답은 Anthropic 원문 그대로.
+    네트워크·인코딩 실패는 status 0 으로 돌려 라우트가 500 으로 죽지 않게 한다."""
+    try:
+        resp, status = _anthropic_request({**body, "stream": False})
+        data = resp.read()
+        return status, data
+    except Exception:
+        return 0, b""
 
 
 def _anthropic_text(data_bytes: bytes) -> str:
@@ -967,8 +984,9 @@ def _anthropic_text(data_bytes: bytes) -> str:
 @app.post("/api/ai")
 async def ai_proxy(request: Request):
     body = await read_json(request)
-    if not ANTHROPIC_KEY:
-        return JSONResponse({"error": {"message": "AI 키(SAKYOWON_ANTHROPIC_KEY)가 설정되지 않았습니다."}})
+    prob = anthropic_key_problem()
+    if prob:
+        return JSONResponse({"error": {"message": f"AI 키(SAKYOWON_ANTHROPIC_KEY) 문제: {prob}"}})
     if AI_MODEL:
         body["model"] = AI_MODEL  # 클라이언트가 보낸 옛 모델 ID를 현재 모델로 통일
 
@@ -992,8 +1010,9 @@ async def ai_proxy(request: Request):
 @app.post("/api/ai/chat")
 async def ai_chat(request: Request):
     body = await read_json(request)
-    if not ANTHROPIC_KEY:
-        return {"answer": "AI 기능이 아직 연결되지 않았습니다. (서버에 SAKYOWON_ANTHROPIC_KEY 미설정)"}
+    prob = anthropic_key_problem()
+    if prob:
+        return {"answer": f"AI 기능이 아직 연결되지 않았습니다. (서버 SAKYOWON_ANTHROPIC_KEY — {prob})"}
     prompt = s(body.get("prompt"))
     context = s(body.get("context"))
     history = body.get("history") if isinstance(body.get("history"), list) else []
@@ -1014,6 +1033,10 @@ async def ai_chat(request: Request):
     status, data = await run_in_threadpool(_anthropic_once, areq)
     answer = _anthropic_text(data)
     if not answer:
+        if status == 0:
+            return {"answer": "(AI 서버에 연결하지 못했습니다. 키 설정과 네트워크를 확인해 주세요.)"}
+        if status == 401:
+            return {"answer": "(AI 키가 거부되었습니다. SAKYOWON_ANTHROPIC_KEY 값을 확인해 주세요.)"}
         return {"answer": "(응답을 생성하지 못했습니다. 잠시 후 다시 시도해 주세요.)"}
     return {"answer": answer}
 
@@ -1024,8 +1047,8 @@ async def translate(request: Request):
     text = s(body.get("text"))
     if not text:
         return {"translated": ""}
-    if not ANTHROPIC_KEY:
-        # 키가 없으면 프론트가 MyMemory 공용 API로 폴백하도록 실패를 알린다.
+    if anthropic_key_problem():
+        # 키가 없거나 쓸 수 없으면 프론트가 MyMemory 공용 API로 폴백하도록 실패를 알린다.
         return JSONResponse({"ok": False, "error": "번역 백엔드 미설정"}, status_code=503)
     target = s(body.get("target")) or "ko"
     system = (
