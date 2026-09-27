@@ -7,7 +7,7 @@
 
 설치·배포 절차는 같은 폴더의 README.md 참고.
 
-의존성: fastapi, uvicorn  (DB는 파이썬 표준 sqlite3만 사용)
+의존성: fastapi, uvicorn, openpyxl(엑셀 업로드)  (DB는 파이썬 표준 sqlite3만 사용)
 
 주요 엔드포인트
   GET  /api/health                      상태 확인
@@ -50,7 +50,7 @@ import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from fastapi import FastAPI, Query, Request
 from fastapi.concurrency import run_in_threadpool
@@ -88,7 +88,7 @@ if ALLOW_ORIGINS:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=ALLOW_ORIGINS,
-        allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
+        allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["Content-Type"],
         allow_credentials=True,  # 통합 계정 쿠키(sk_session)를 다른 출처에서도 쓸 수 있게
     )
@@ -1300,3 +1300,660 @@ async def translate(request: Request):
     if not out:
         return JSONResponse({"ok": False, "error": "번역 실패"}, status_code=502)
     return {"translated": out}
+
+
+# ═══════════════════════════ 데이터 저장소 (엑셀 → 표 → API) ═══════════════════════════
+# 이사장님이 엑셀/CSV를 올리면 표(테이블)로 저장하고, 수파베이스처럼 REST·SQL로 조회한다.
+#   화면: https://sakyowon.co.kr/data.html (허브 레포)   CLI: tools/skdata.py
+#   권한: 관리자 키·직원(staff/admin) 세션 = 읽기+쓰기 / 읽기 키(SAKYOWON_DATA_READ_KEY) = 읽기만
+# 별도 DB 파일(datasets.db)을 써서 잘못된 업로드가 계정·신청 DB를 건드리지 못하게 한다.
+# 표 이름은 영문 소문자·숫자·밑줄만(예: mangnam_2024). 실제 SQLite 테이블 이름도 그대로라
+# SQL 조회에서 `SELECT * FROM mangnam_2024` 처럼 쓴다. 각 행에는 `_id`(자동 번호)가 붙는다.
+
+DATA_DB_PATH = os.environ.get("SAKYOWON_DATA_DB", os.path.join(os.path.dirname(DB_PATH), "datasets.db"))
+DATA_READ_KEY = os.environ.get("SAKYOWON_DATA_READ_KEY", "")
+DATA_MAX_UPLOAD = 30 * 1024 * 1024
+DATA_MAX_ROWS = 5000        # JSON 1회 조회 상한
+DATA_MAX_CSV_ROWS = 200000  # CSV 내보내기 상한
+DATA_SQL_TIMEOUT = 8        # 초
+DATA_RESERVED_PARAMS = {"limit", "offset", "order", "q", "format", "key", "select"}
+DATA_OPS = {"eq": "=", "neq": "!=", "gt": ">", "gte": ">=", "lt": "<", "lte": "<=", "like": "LIKE", "in": "IN", "is": "IS"}
+_DATA_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
+
+
+@contextmanager
+def data_db(readonly: bool = False):
+    os.makedirs(os.path.dirname(DATA_DB_PATH), exist_ok=True)
+    if readonly:
+        conn = sqlite3.connect(f"file:{DATA_DB_PATH}?mode=ro", uri=True, timeout=20)
+    else:
+        conn = sqlite3.connect(DATA_DB_PATH, timeout=20)
+    conn.row_factory = sqlite3.Row
+    try:
+        if not readonly:
+            conn.execute("PRAGMA journal_mode=WAL")
+        yield conn
+        if not readonly:
+            conn.commit()
+    finally:
+        conn.close()
+
+
+def init_data_db():
+    with data_db() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS _catalog (
+                name        TEXT PRIMARY KEY,
+                title       TEXT,
+                columns     TEXT NOT NULL,
+                source      TEXT,
+                sheet       TEXT,
+                row_count   INTEGER DEFAULT 0,
+                note        TEXT,
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL,
+                updated_by  TEXT
+            )
+            """
+        )
+
+
+init_data_db()
+
+
+def qi(name: str) -> str:
+    """SQLite 식별자 인용."""
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def data_access(request: Request, key: str = "", write: bool = False):
+    """데이터 저장소 권한. 허용되면 행위자 이름, 아니면 None."""
+    k = s(key) or s(request.headers.get("x-data-key", ""))
+    if ADMIN_KEY and k and hmac.compare_digest(k, ADMIN_KEY):
+        return "admin-key"
+    if not write and DATA_READ_KEY and k and hmac.compare_digest(k, DATA_READ_KEY):
+        return "read-key"
+    u = current_user(request)
+    if u and u["role"] in ("admin", "staff"):
+        return u["username"]
+    return None
+
+
+def data_slug(raw: str) -> str:
+    """파일명·입력값에서 표 이름(영문 소문자·숫자·밑줄)을 만든다. 한글만 있으면 날짜 기반 이름."""
+    x = s(raw).lower()
+    x = re.sub(r"\.(xlsx|xlsm|xls|csv|tsv|txt)$", "", x)
+    x = re.sub(r"[^a-z0-9_]+", "_", x).strip("_")
+    x = re.sub(r"_+", "_", x)
+    if not x:
+        x = "table_" + datetime.now().strftime("%y%m%d_%H%M")
+    elif not x[0].isalpha():
+        x = "t_" + x
+    return x[:63]
+
+
+def _cell(v):
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return int(v)
+    if isinstance(v, datetime):
+        if (v.hour, v.minute, v.second) == (0, 0, 0):
+            return v.strftime("%Y-%m-%d")
+        return v.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(v, date):
+        return v.isoformat()
+    if isinstance(v, float):
+        return int(v) if v.is_integer() else v
+    if isinstance(v, (int,)):
+        return v
+    x = str(v).strip()
+    return x if x else None
+
+
+_INT_RE = re.compile(r"^-?(0|[1-9]\d{0,17})$")
+_NUM_RE = re.compile(r"^-?(0|[1-9]\d{0,17})\.\d+$")
+
+
+def _coerce_str(v):
+    """CSV처럼 전부 문자열인 값을 숫자로 살짝 바꾼다(앞자리 0·전화번호·주민번호는 문자열 유지)."""
+    v = _cell(v)
+    if not isinstance(v, str):
+        return v
+    raw = v.replace(",", "") if re.match(r"^-?\d{1,3}(,\d{3})+(\.\d+)?$", v) else v
+    if _INT_RE.match(raw):
+        return int(raw)
+    if _NUM_RE.match(raw):
+        return float(raw)
+    return v
+
+
+def _read_sheets(filename: str, data: bytes):
+    """파일을 시트 목록 [{sheet, rows}]로 읽는다. rows는 값 2차원 배열."""
+    ext = (filename.rsplit(".", 1)[-1] if "." in filename else "").lower()
+    if ext in ("xlsx", "xlsm"):
+        try:
+            import openpyxl  # 서버 requirements.txt에 포함
+        except ImportError:
+            raise ValueError("openpyxl_missing")
+        wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+        out = []
+        for ws in wb.worksheets:
+            # 시스템에서 내보낸 엑셀은 숫자가 문자열로 들어오는 일이 많아 CSV와 같은 규칙으로 살짝 숫자화한다
+            rows = [[_coerce_str(c) for c in r] for r in ws.iter_rows(values_only=True)]
+            out.append({"sheet": ws.title, "rows": rows})
+        wb.close()
+        return out
+    if ext == "xls":
+        raise ValueError("xls_unsupported")
+    if ext in ("csv", "tsv", "txt", ""):
+        text = None
+        for enc in ("utf-8-sig", "cp949", "euc-kr", "latin-1"):
+            try:
+                text = data.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        if ext == "tsv":
+            delim = "\t"
+        else:
+            try:
+                delim = csv.Sniffer().sniff(text[:4096], delimiters=",\t;|").delimiter
+            except csv.Error:
+                delim = ","
+        rows = [[_coerce_str(c) for c in r] for r in csv.reader(io.StringIO(text), delimiter=delim)]
+        return [{"sheet": "Sheet1", "rows": rows}]
+    raise ValueError("unsupported_format")
+
+
+def _build_table(rows, header_row=None):
+    """2차원 값 배열 → (columns[{name,type}], records[list], header_index). header_row는 1부터."""
+    rows = [r for r in rows]
+    # 뒤쪽 완전 빈 행 제거
+    while rows and all(v is None for v in rows[-1]):
+        rows.pop()
+    if not rows:
+        raise ValueError("empty_sheet")
+    counts = [sum(1 for v in r if v is not None) for r in rows[:20]]
+    if header_row and 1 <= int(header_row) <= len(rows):
+        hi = int(header_row) - 1
+    else:
+        best = max(counts) if counts else 0
+        hi = next((i for i, c in enumerate(counts) if c >= 2 and c >= best * 0.6), 0)
+    header = rows[hi]
+    width = max(len(r) for r in rows)
+    header = list(header) + [None] * (width - len(header))
+    names, seen = [], set()
+    for i, h in enumerate(header):
+        n = re.sub(r"\s+", " ", s(h)).replace('"', "'")
+        auto = not n
+        if auto:
+            n = f"열{i + 1}"
+        if n.lower() == "_id":
+            n = "id_"
+        base, k = n, 2
+        while n.lower() in seen:
+            n = f"{base}_{k}"; k += 1
+        seen.add(n.lower())
+        names.append((n, auto))
+    records = []
+    for r in rows[hi + 1:]:
+        r = list(r) + [None] * (width - len(r))
+        if all(v is None for v in r):
+            continue
+        records.append(r[:width])
+    # 자동 이름 열인데 값이 전혀 없으면 버린다
+    keep = [i for i, (n, auto) in enumerate(names) if not (auto and all(rec[i] is None for rec in records))]
+    columns = []
+    for i in keep:
+        vals = [rec[i] for rec in records if rec[i] is not None]
+        if vals and all(isinstance(v, int) and not isinstance(v, bool) for v in vals):
+            t = "INTEGER"
+        elif vals and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in vals):
+            t = "REAL"
+        else:
+            t = "TEXT"
+        columns.append({"name": names[i][0], "type": t})
+    records = [[rec[i] for i in keep] for rec in records]
+    return columns, records, hi + 1
+
+
+def _catalog_row(r) -> dict:
+    d = dict(r)
+    d["columns"] = json.loads(d.get("columns") or "[]")
+    return d
+
+
+def _get_catalog(conn, name: str):
+    r = conn.execute("SELECT * FROM _catalog WHERE name = ?", (name,)).fetchone()
+    return _catalog_row(r) if r else None
+
+
+def _store_table(conn, name: str, columns, records, mode: str, meta: dict, actor: str):
+    """표를 만들거나(replace) 이어 붙인다(append). 카탈로그도 갱신."""
+    existing = _get_catalog(conn, name)
+    if mode == "append" and existing:
+        have = {c["name"].lower(): c for c in existing["columns"]}
+        for c in columns:
+            if c["name"].lower() not in have:
+                conn.execute(f"ALTER TABLE {qi(name)} ADD COLUMN {qi(c['name'])} {c['type']}")
+                existing["columns"].append(c)
+        columns_all = existing["columns"]
+    else:
+        conn.execute(f"DROP TABLE IF EXISTS {qi(name)}")
+        cols_sql = ", ".join(f"{qi(c['name'])} {c['type']}" for c in columns)
+        conn.execute(f"CREATE TABLE {qi(name)} (\"_id\" INTEGER PRIMARY KEY AUTOINCREMENT{', ' + cols_sql if cols_sql else ''})")
+        columns_all = columns
+        mode = "replace"
+    if records:
+        names = [c["name"] for c in columns]
+        conn.executemany(
+            f"INSERT INTO {qi(name)} ({', '.join(qi(n) for n in names)}) VALUES ({', '.join('?' * len(names))})",
+            records,
+        )
+    total = conn.execute(f"SELECT COUNT(*) FROM {qi(name)}").fetchone()[0]
+    now = now_iso()
+    if existing:
+        conn.execute(
+            "UPDATE _catalog SET title = ?, columns = ?, source = ?, sheet = ?, row_count = ?, updated_at = ?, updated_by = ?"
+            " WHERE name = ?",
+            (meta.get("title") or existing["title"], json.dumps(columns_all, ensure_ascii=False), meta.get("source"),
+             meta.get("sheet"), total, now, actor, name),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO _catalog (name, title, columns, source, sheet, row_count, note, created_at, updated_at, updated_by)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (name, meta.get("title") or name, json.dumps(columns_all, ensure_ascii=False), meta.get("source"),
+             meta.get("sheet"), total, "", now, now, actor),
+        )
+    return _get_catalog(conn, name)
+
+
+async def _read_upload(request: Request):
+    data = await request.body()
+    if not data:
+        raise ValueError("empty_file")
+    if len(data) > DATA_MAX_UPLOAD:
+        raise ValueError("file_too_large")
+    return data
+
+
+@app.get("/api/data/tables")
+def data_tables(request: Request, key: str = Query("")):
+    if not data_access(request, key):
+        return err("unauthorized", 401)
+    with data_db() as conn:
+        rows = conn.execute("SELECT * FROM _catalog ORDER BY updated_at DESC").fetchall()
+    return {"ok": True, "items": [_catalog_row(r) for r in rows], "read_key_set": bool(DATA_READ_KEY)}
+
+
+@app.post("/api/data/inspect")
+async def data_inspect(request: Request, filename: str = Query(""), key: str = Query(""), header_row: int = Query(0)):
+    """파일을 저장하지 않고 시트·열·미리보기만 돌려준다(업로드 마법사용)."""
+    if not data_access(request, key, write=True):
+        return err("unauthorized", 401)
+    filename = s(filename) or s(request.headers.get("x-filename", ""))
+    try:
+        data = await _read_upload(request)
+        sheets = await run_in_threadpool(_read_sheets, filename, data)
+    except ValueError as e:
+        return err(str(e), 400)
+    except Exception:
+        return err("parse_failed", 400)
+    out = []
+    for sh in sheets:
+        try:
+            columns, records, hrow = _build_table(sh["rows"], header_row or None)
+        except ValueError:
+            out.append({"sheet": sh["sheet"], "empty": True})
+            continue
+        out.append({"sheet": sh["sheet"], "header_row": hrow, "columns": columns, "row_count": len(records),
+                    "preview": records[:5]})
+    return {"ok": True, "filename": filename, "suggested_name": data_slug(filename), "sheets": out}
+
+
+@app.post("/api/data/import")
+async def data_import(
+    request: Request,
+    name: str = Query(""),
+    title: str = Query(""),
+    sheet: str = Query(""),
+    mode: str = Query("replace"),
+    filename: str = Query(""),
+    header_row: int = Query(0),
+    key: str = Query(""),
+):
+    """엑셀/CSV 본문(raw bytes)을 표로 저장. mode=replace(기본)|append."""
+    actor = data_access(request, key, write=True)
+    if not actor:
+        return err("unauthorized", 401)
+    filename = s(filename) or s(request.headers.get("x-filename", "")) or "upload.xlsx"
+    name = data_slug(name or filename)
+    if not _DATA_NAME_RE.match(name) or name.startswith("sqlite_"):
+        return err("bad_name", 400)
+    mode = "append" if s(mode) == "append" else "replace"
+    try:
+        data = await _read_upload(request)
+        sheets = await run_in_threadpool(_read_sheets, filename, data)
+    except ValueError as e:
+        return err(str(e), 400)
+    except Exception:
+        return err("parse_failed", 400)
+    picked = None
+    if s(sheet):
+        picked = next((x for x in sheets if x["sheet"] == s(sheet)), None)
+        if picked is None:
+            return err("sheet_not_found", 400)
+    else:
+        picked = next((x for x in sheets if any(any(v is not None for v in r) for r in x["rows"])), sheets[0])
+    try:
+        columns, records, _ = _build_table(picked["rows"], header_row or None)
+    except ValueError as e:
+        return err(str(e), 400)
+    meta = {"title": s(title), "source": filename, "sheet": picked["sheet"]}
+    with data_db() as conn:
+        entry = _store_table(conn, name, columns, records, mode, meta, actor)
+    return {"ok": True, "table": entry, "imported": len(records), "mode": mode}
+
+
+@app.get("/api/data/tables/{name}")
+def data_table_info(name: str, request: Request, key: str = Query("")):
+    if not data_access(request, key):
+        return err("unauthorized", 401)
+    with data_db() as conn:
+        entry = _get_catalog(conn, name)
+    if not entry:
+        return err("not_found", 404)
+    return {"ok": True, "table": entry}
+
+
+@app.patch("/api/data/tables/{name}")
+async def data_table_update(name: str, request: Request, key: str = Query("")):
+    """제목·메모 수정, 또는 이름 변경(new_name)."""
+    actor = data_access(request, key, write=True)
+    if not actor:
+        return err("unauthorized", 401)
+    body = await read_json(request)
+    with data_db() as conn:
+        entry = _get_catalog(conn, name)
+        if not entry:
+            return err("not_found", 404)
+        sets, args = ["updated_at = ?", "updated_by = ?"], [now_iso(), actor]
+        if "title" in body:
+            sets.append("title = ?"); args.append(s(body["title"]) or name)
+        if "note" in body:
+            sets.append("note = ?"); args.append(s(body["note"]))
+        new_name = data_slug(body.get("new_name", "")) if s(body.get("new_name")) else ""
+        if new_name and new_name != name:
+            if not _DATA_NAME_RE.match(new_name) or _get_catalog(conn, new_name):
+                return err("bad_name", 400)
+            conn.execute(f"ALTER TABLE {qi(name)} RENAME TO {qi(new_name)}")
+            sets.append("name = ?"); args.append(new_name)
+        args.append(name)
+        conn.execute(f"UPDATE _catalog SET {', '.join(sets)} WHERE name = ?", args)
+        entry = _get_catalog(conn, new_name or name)
+    return {"ok": True, "table": entry}
+
+
+@app.delete("/api/data/tables/{name}")
+def data_table_delete(name: str, request: Request, key: str = Query("")):
+    if not data_access(request, key, write=True):
+        return err("unauthorized", 401)
+    with data_db() as conn:
+        if not _get_catalog(conn, name):
+            return err("not_found", 404)
+        conn.execute(f"DROP TABLE IF EXISTS {qi(name)}")
+        conn.execute("DELETE FROM _catalog WHERE name = ?", (name,))
+    return {"ok": True}
+
+
+def _parse_filters(params, colnames):
+    """?열=op.값 형식 → (where_sql, args). 열 이름은 대소문자 무시."""
+    lower = {c.lower(): c for c in colnames}
+    where, args = [], []
+    for k, v in params:
+        if k in DATA_RESERVED_PARAMS:
+            continue
+        col = lower.get(k.lower())
+        if col is None:
+            raise ValueError(f"unknown_column:{k}")
+        op, _, val = v.partition(".")
+        if op not in DATA_OPS:
+            op, val = "eq", v
+        c = qi(col)
+        if op == "in":
+            items = [x.strip() for x in val.strip("()").split(",") if x.strip() != ""]
+            if not items:
+                raise ValueError("bad_filter")
+            where.append(f"{c} IN ({', '.join('?' * len(items))})"); args.extend(_coerce_str(x) for x in items)
+        elif op == "is":
+            where.append(f"{c} IS NULL" if val.lower() in ("null", "") else f"{c} IS NOT NULL")
+        elif op == "like":
+            pat = val.replace("*", "%")
+            if "%" not in pat and "_" not in pat:
+                pat = f"%{pat}%"
+            where.append(f"{c} LIKE ?"); args.append(pat)
+        else:
+            where.append(f"{c} {DATA_OPS[op]} ?"); args.append(_coerce_str(val))
+    return where, args
+
+
+@app.get("/api/data/tables/{name}/rows")
+def data_rows(
+    request: Request,
+    name: str,
+    key: str = Query(""),
+    limit: int = Query(100),
+    offset: int = Query(0),
+    order: str = Query(""),
+    q: str = Query(""),
+    select: str = Query(""),
+    format: str = Query("json"),
+):
+    """행 조회. 필터: ?열=eq.값 | neq | gt | gte | lt | lte | like.*부분* | in.(a,b) | is.null
+    ?q=검색어 는 모든 열 부분일치. ?order=열.desc,열2.asc  ?select=열,열2  ?format=csv"""
+    if not data_access(request, key):
+        return err("unauthorized", 401)
+    with data_db() as conn:
+        entry = _get_catalog(conn, name)
+        if not entry:
+            return err("not_found", 404)
+        colnames = ["_id"] + [c["name"] for c in entry["columns"]]
+        lower = {c.lower(): c for c in colnames}
+        try:
+            where, args = _parse_filters(request.query_params.multi_items(), colnames)
+        except ValueError as e:
+            return err(str(e), 400)
+        if s(q):
+            like = f"%{s(q)}%"
+            where.append("(" + " OR ".join(f"CAST({qi(c)} AS TEXT) LIKE ?" for c in colnames[1:]) + ")")
+            args.extend([like] * (len(colnames) - 1))
+        sel = colnames
+        if s(select):
+            sel = []
+            for x in select.split(","):
+                c = lower.get(x.strip().lower())
+                if c is None:
+                    return err(f"unknown_column:{x.strip()}", 400)
+                sel.append(c)
+        order_sql = []
+        for part in [p.strip() for p in order.split(",") if p.strip()]:
+            col, _, d = part.partition(".")
+            c = lower.get(col.strip().lower())
+            if c is None:
+                return err(f"unknown_column:{col}", 400)
+            order_sql.append(f"{qi(c)} {'DESC' if d.lower() == 'desc' else 'ASC'}")
+        where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+        order_clause = " ORDER BY " + (", ".join(order_sql) if order_sql else '"_id"')
+        total = conn.execute(f"SELECT COUNT(*) FROM {qi(name)}{where_sql}", args).fetchone()[0]
+        if format == "csv":
+            lim = max(1, min(limit if limit > 100 else DATA_MAX_CSV_ROWS, DATA_MAX_CSV_ROWS))
+        else:
+            lim = max(1, min(limit, DATA_MAX_ROWS))
+        rows = conn.execute(
+            f"SELECT {', '.join(qi(c) for c in sel)} FROM {qi(name)}{where_sql}{order_clause} LIMIT ? OFFSET ?",
+            args + [lim, max(0, offset)],
+        ).fetchall()
+    if format == "csv":
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(sel)
+        for r in rows:
+            w.writerow(["" if v is None else v for v in r])
+        return Response(
+            "﻿" + buf.getvalue(),
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f"attachment; filename=\"{name}.csv\""},
+        )
+    return {"ok": True, "table": name, "columns": sel, "total": total, "limit": lim, "offset": max(0, offset),
+            "items": [dict(zip(sel, r)) for r in rows]}
+
+
+def _row_values(entry, body: dict):
+    lower = {c["name"].lower(): c["name"] for c in entry["columns"]}
+    out = {}
+    for k, v in body.items():
+        if k == "_id":
+            continue
+        c = lower.get(str(k).lower())
+        if c is None:
+            raise ValueError(f"unknown_column:{k}")
+        out[c] = _cell(v) if not isinstance(v, str) else _coerce_str(v)
+    return out
+
+
+@app.post("/api/data/tables/{name}/rows")
+async def data_rows_insert(name: str, request: Request, key: str = Query("")):
+    """행 추가. 본문은 {열:값} 하나 또는 {"rows":[{...},...]}."""
+    actor = data_access(request, key, write=True)
+    if not actor:
+        return err("unauthorized", 401)
+    body = await read_json(request)
+    rows = body.get("rows") if isinstance(body, dict) and isinstance(body.get("rows"), list) else [body]
+    with data_db() as conn:
+        entry = _get_catalog(conn, name)
+        if not entry:
+            return err("not_found", 404)
+        ids = []
+        try:
+            for r in rows:
+                if not isinstance(r, dict):
+                    return err("bad_request", 400)
+                vals = _row_values(entry, r)
+                if not vals:
+                    cur = conn.execute(f"INSERT INTO {qi(name)} DEFAULT VALUES")
+                else:
+                    cur = conn.execute(
+                        f"INSERT INTO {qi(name)} ({', '.join(qi(c) for c in vals)}) VALUES ({', '.join('?' * len(vals))})",
+                        list(vals.values()),
+                    )
+                ids.append(cur.lastrowid)
+        except ValueError as e:
+            return err(str(e), 400)
+        total = conn.execute(f"SELECT COUNT(*) FROM {qi(name)}").fetchone()[0]
+        conn.execute("UPDATE _catalog SET row_count = ?, updated_at = ?, updated_by = ? WHERE name = ?",
+                     (total, now_iso(), actor, name))
+    return {"ok": True, "ids": ids, "row_count": total}
+
+
+@app.patch("/api/data/tables/{name}/rows/{rid}")
+async def data_row_update(name: str, rid: int, request: Request, key: str = Query("")):
+    actor = data_access(request, key, write=True)
+    if not actor:
+        return err("unauthorized", 401)
+    body = await read_json(request)
+    with data_db() as conn:
+        entry = _get_catalog(conn, name)
+        if not entry:
+            return err("not_found", 404)
+        try:
+            vals = _row_values(entry, body)
+        except ValueError as e:
+            return err(str(e), 400)
+        if not vals:
+            return err("bad_request", 400)
+        cur = conn.execute(
+            f"UPDATE {qi(name)} SET {', '.join(f'{qi(c)} = ?' for c in vals)} WHERE \"_id\" = ?",
+            list(vals.values()) + [rid],
+        )
+        if cur.rowcount == 0:
+            return err("not_found", 404)
+        conn.execute("UPDATE _catalog SET updated_at = ?, updated_by = ? WHERE name = ?", (now_iso(), actor, name))
+    return {"ok": True}
+
+
+@app.delete("/api/data/tables/{name}/rows/{rid}")
+def data_row_delete(name: str, rid: int, request: Request, key: str = Query("")):
+    actor = data_access(request, key, write=True)
+    if not actor:
+        return err("unauthorized", 401)
+    with data_db() as conn:
+        entry = _get_catalog(conn, name)
+        if not entry:
+            return err("not_found", 404)
+        cur = conn.execute(f"DELETE FROM {qi(name)} WHERE \"_id\" = ?", (rid,))
+        if cur.rowcount == 0:
+            return err("not_found", 404)
+        total = conn.execute(f"SELECT COUNT(*) FROM {qi(name)}").fetchone()[0]
+        conn.execute("UPDATE _catalog SET row_count = ?, updated_at = ?, updated_by = ? WHERE name = ?",
+                     (total, now_iso(), actor, name))
+    return {"ok": True, "row_count": total}
+
+
+_SQL_ALLOWED_ACTIONS = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION, sqlite3.SQLITE_RECURSIVE}
+
+
+_SQL_ALLOWED_PRAGMAS = {"table_info", "table_xinfo", "table_list", "index_list", "index_info", "foreign_key_list"}
+
+
+def _sql_authorizer(action, arg1, arg2, dbname, trigger):
+    if action in _SQL_ALLOWED_ACTIONS:
+        return sqlite3.SQLITE_OK
+    if action == sqlite3.SQLITE_PRAGMA and (arg1 or "").lower() in _SQL_ALLOWED_PRAGMAS:
+        return sqlite3.SQLITE_OK
+    return sqlite3.SQLITE_DENY
+
+
+def _strip_sql_comments(sql: str) -> str:
+    sql = re.sub(r"/\*.*?\*/", " ", sql, flags=re.S)
+    sql = re.sub(r"--[^\n]*", " ", sql)
+    return sql.strip().rstrip(";").strip()
+
+
+def _run_select(sql: str, params):
+    with data_db(readonly=True) as conn:
+        conn.set_authorizer(_sql_authorizer)
+        deadline = time.time() + DATA_SQL_TIMEOUT
+        conn.set_progress_handler(lambda: 1 if time.time() > deadline else 0, 20000)
+        cur = conn.execute(sql, params)
+        cols = [d[0] for d in cur.description] if cur.description else []
+        rows = cur.fetchmany(DATA_MAX_ROWS + 1)
+    return cols, rows
+
+
+@app.post("/api/data/sql")
+async def data_sql(request: Request, key: str = Query("")):
+    """읽기 전용 SQL(SELECT/WITH만). 본문 {"sql": "...", "params": [...]}. 최대 5000행."""
+    if not data_access(request, key):
+        return err("unauthorized", 401)
+    body = await read_json(request)
+    sql = _strip_sql_comments(s(body.get("sql")))
+    params = body.get("params") or []
+    if not isinstance(params, list):
+        return err("bad_request", 400)
+    if not sql or not re.match(r"^(select|with)\b", sql, re.I) or ";" in sql:
+        return err("select_only", 400)
+    try:
+        cols, rows = await run_in_threadpool(_run_select, sql, params)
+    except sqlite3.OperationalError as e:
+        msg = str(e)
+        if "interrupted" in msg:
+            return err("timeout", 408)
+        return JSONResponse({"ok": False, "error": "sql_error", "detail": msg}, status_code=400)
+    except sqlite3.DatabaseError as e:
+        return JSONResponse({"ok": False, "error": "sql_error", "detail": str(e)}, status_code=400)
+    truncated = len(rows) > DATA_MAX_ROWS
+    rows = rows[:DATA_MAX_ROWS]
+    return {"ok": True, "columns": cols, "rows": [list(r) for r in rows], "count": len(rows), "truncated": truncated}
