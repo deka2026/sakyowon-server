@@ -1985,3 +1985,57 @@ async def data_sql(request: Request, key: str = Query("")):
     truncated = len(rows) > DATA_MAX_ROWS
     rows = rows[:DATA_MAX_ROWS]
     return {"ok": True, "columns": cols, "rows": [list(r) for r in rows], "count": len(rows), "truncated": truncated}
+
+
+# ─────────────────── 문서 자동판독 (햇소자 자료함) ───────────────────
+# 2026-09-28 신설. 원본을 저장하지 않는다 — 메모리에서 읽고 값만 돌려준다.
+
+@app.post("/api/docs/ingest")
+async def docs_ingest(request: Request):
+    """자료함이 올린 서류에서 값을 뽑아 돌려준다.
+
+    multipart/form-data 로 `kind` + `file` 을 받는다.
+    파일 없이 JSON(`{kind, name}`)만 오면 '아직 못 읽는다'로 답해 화면이 수기 입력으로 넘어가게 한다.
+    """
+    if post_limited(request):
+        return JSONResponse({"ok": False, "error": "요청이 너무 잦습니다. 잠시 후 다시 시도해 주세요."}, status_code=429)
+
+    ctype = (request.headers.get("content-type") or "").lower()
+    if "multipart/form-data" not in ctype:
+        # 파일이 안 온 경우 — 화면은 fields 가 없으면 수기 입력으로 폴백한다
+        return JSONResponse({"ok": False, "error": "파일이 없습니다. 자료함에서 파일과 함께 보내 주세요."}, status_code=400)
+
+    try:
+        form = await request.form()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "요청을 읽지 못했습니다."}, status_code=400)
+
+    kind = s(form.get("kind"))
+    up = form.get("file")
+    if not kind or up is None or not hasattr(up, "read"):
+        return JSONResponse({"ok": False, "error": "kind 와 file 이 필요합니다."}, status_code=400)
+
+    data = await up.read()
+    name = s(getattr(up, "filename", "")) or "(이름없음)"
+    if not data:
+        return JSONResponse({"ok": False, "error": "빈 파일입니다."}, status_code=400)
+
+    import docs_ingest as _di
+    try:
+        결과 = await run_in_threadpool(_di.판독, kind, name, data)
+    except ValueError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=422)
+    except Exception:
+        return JSONResponse({"ok": False, "error": "판독 중 오류가 났습니다."}, status_code=500)
+    finally:
+        del data          # 원본은 여기서 끝이다. 디스크에 남기지 않는다
+
+    결과["ok"] = True
+    return JSONResponse(결과)
+
+
+@app.get("/api/docs/kinds")
+async def docs_kinds():
+    """어떤 자료를 자동판독할 수 있는지 — 화면이 미리 물어볼 수 있게."""
+    import docs_ingest as _di
+    return {"ok": True, "지원": _di.지원유형, "최대바이트": _di.MAX_BYTES}
