@@ -1161,6 +1161,12 @@ async def ai_health():
 
 @app.post("/api/ai")
 async def ai_proxy(request: Request):
+    # 🔴 로그인 필수(26-09-28). 그전까지 비로그인 누구나 부를 수 있어 사교원 AI 이용료가
+    # 공개 노출돼 있었다. 햇소자는 승인된 이용자의 업무도구다.
+    # 401 을 프런트(callAIDoc)가 읽는 모양({error:{message}})으로 돌려준다 — 프런트 수정 0.
+    if current_user(request) is None:
+        return JSONResponse(
+            {"error": {"message": "로그인이 필요합니다. 화면 오른쪽 위에서 로그인한 뒤 다시 질문해 주세요. 계정이 없으면 가입 신청 후 승인을 받으시면 됩니다."}}, status_code=401)
     body = await read_json(request)
     prob = anthropic_key_problem()
     if prob:
@@ -1190,6 +1196,16 @@ async def ai_proxy(request: Request):
 
 @app.post("/api/ai/chat")
 async def ai_chat(request: Request):
+    # 🔴 로그인 필수(26-09-28). 이 경로는 품에 엔진(넥서스 H200)으로 나간다 —
+    # 무인증으로 열어 두면 클라이언트 상한(분당 20·동시 5)을 외부가 먹고 직원이 못 쓴다.
+    # 401 에 answer 를 함께 담는다 — 햇소자 프런트가 d.answer 를 그대로 띄우므로
+    # 「연결 실패」가 아니라 로그인 안내가 보인다(프런트 수정 0).
+    user = current_user(request)
+    if user is None:
+        return JSONResponse(
+            {"ok": False, "error": "unauthorized",
+             "answer": "로그인이 필요합니다. 화면 오른쪽 위에서 로그인한 뒤 다시 질문해 주세요. 계정이 없으면 가입 신청 후 승인을 받으시면 됩니다.",
+             "backend": "none"}, status_code=401)
     body = await read_json(request)
     prompt = s(body.get("prompt"))
     context = s(body.get("context"))
@@ -1213,7 +1229,7 @@ async def ai_chat(request: Request):
         if topic in POOME_TOPICS:
             ctx["topic"] = topic
         # 마을 익명키는 서버에서 조회한다. 프런트가 보낸 값은 쓰지 않는다(실명 유출·위조 방지).
-        vref = village_ref_of_user(current_user(request))
+        vref = village_ref_of_user(user)
         if vref:
             ctx["village_ref"] = vref
         if ctx:
@@ -1300,6 +1316,18 @@ async def translate(request: Request):
     if not out:
         return JSONResponse({"ok": False, "error": "번역 실패"}, status_code=502)
     return {"translated": out}
+
+
+
+# --- mangnam-coop 운영 모듈 (install-on-server.sh) ---
+# 망남마을협동조합 월별 회계·회의록·문서 보관·경영공시/실적 게시 (/api/mangnam/*).
+# 코드: https://github.com/deka2026/mangnam-coop/blob/main/server/mangnam_api.py
+try:
+    from mangnam_api import install as _install_mangnam
+    _install_mangnam(app, db=db, admin_ok=admin_ok, current_user=current_user,
+                     now_iso=now_iso, new_id=new_id, s=s, db_path=DB_PATH)
+except ImportError as _e:  # 모듈 파일이 없으면 기존 기능만 그대로 돈다
+    print("mangnam_api 미탑재:", _e)
 
 
 # ═══════════════════════════ 데이터 저장소 (엑셀 → 표 → API) ═══════════════════════════

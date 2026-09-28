@@ -49,7 +49,9 @@ def call(method, path, params=None, body=None, raw=None, headers=None):
     url = base + path
     if params:
         url += "?" + urllib.parse.urlencode({k: v for k, v in params if v not in (None, "")}, doseq=True)
-    h = {"X-Data-Key": key}
+    # 🔴 User-Agent 필수: sakyowon.co.kr 이 Cloudflare 뒤로 들어간 뒤(26-09-28)
+    # urllib 기본 UA(Python-urllib/3.x)는 봇으로 막혀 403 error code 1010 이 난다.
+    h = {"X-Data-Key": key, "User-Agent": "skdata/1.0 (+sakyowon.co.kr)"}
     if headers:
         h.update(headers)
     data = None
