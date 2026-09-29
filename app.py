@@ -297,6 +297,40 @@ def init_db():
             )
             """
         )
+        # ── 수익 배분 정책 (우선순위 폭포식, 2026-09-29 2차) ──
+        # 고정 비율표가 아니라 순위와 요율을 담는다. 조합마다 융자 조건·부지 조건이 달라서
+        # 같은 비율을 씌우면 어떤 조합은 이자도 못 낸다.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dist_policy (
+                village_id INTEGER PRIMARY KEY,
+                policy_loan INTEGER,
+                policy_rate REAL,
+                subsidy_rate REAL,
+                policy_grace INTEGER,
+                policy_term INTEGER,
+                local_loan INTEGER,
+                local_rate REAL,
+                local_term INTEGER,
+                om_rate REAL,
+                ins_rate REAL,
+                sys_rate REAL,
+                land_rate REAL,
+                tax_rate REAL,
+                labor_month INTEGER,
+                repair_rate REAL,
+                work_cap_months INTEGER,
+                legal_reserve REAL,
+                biz_share REAL,
+                degrade REAL,
+                opex_infl REAL,
+                major_year INTEGER,
+                major_rate REAL,
+                updated_at TEXT,
+                updated_by INTEGER
+            )
+            """
+        )
         # ── 재무건전성 컨설팅 보고서 (상담신청 → GPU 엔진 근거 + 서버 계산) ──
         conn.execute(
             """
@@ -1740,6 +1774,359 @@ def fed_findings(st: dict) -> list:
                     "설명": "성과를 회비 대비 표로 공개해 다음 총회의 요율 재의결 근거로 두세요.", "근거": ["공시"]})
     return out
 
+# ───────── 수익 배분: 우선순위 폭포식 (2026-09-29 2차) ─────────
+# 🔴 고정 비율(50/10/20/20)을 쓰지 않는다.
+#   공고는 배분 비율을 정해 주지 않는다 — "출자·적립·배분 등 수입 활용 계획의 공정성·타당성"을
+#   5점으로 평가할 뿐이다. 그런데 표준모델의 '융자상환 20%' 로는 실효금리가 2.1% 만 넘어도
+#   이자에 못 미친다(2026-09-29 부하시험에서 9개 조합 전부 미지급이자 발생).
+#   그래서 비율이 아니라 **순위**로 간다. 위에서부터 채우고 남는 것만 아래로 내려간다.
+#
+#   ① 정책융자 원리금 (이차보전 반영)  — 약정액 전액. 못 채우면 그 해는 부도다.
+#   ② 운영관리비                       — 실비(O&M·보험·계통·부지·세무·인건비) + 수선충당 + 운전자금
+#   ③ 공동사업                         — ①②를 채우고 남은 몫 가운데 총회가 정한 비율
+#   ④ 배당                             — 마지막. 법정적립금을 채운 뒤에만.
+#
+# 융자 조건 근거: 전남광주 민심정책 정리(2026-06-15) — 자부담 15% = 정책금융 85%
+#   (1년 거치 19년 상환·2.5% 변동·정부 이차보전) + 신협 대출 + 지방소멸대응기금 매칭.
+#   🔴 **이차보전은 '추진 사항'이지 확정이 아니다.** 기본값을 0%p 로 두고, 켰을 때
+#   무엇이 달라지는지 화면에서 같이 보여 준다. 유리한 미확정 가정을 기본으로 깔지 않는다.
+
+DIST_FIELDS = (
+    "policy_loan", "policy_rate", "subsidy_rate", "policy_grace", "policy_term",
+    "local_loan", "local_rate", "local_term",
+    "om_rate", "ins_rate", "sys_rate", "land_rate", "tax_rate", "labor_month",
+    "repair_rate", "work_cap_months", "legal_reserve", "biz_share",
+    "degrade", "opex_infl", "major_year", "major_rate",
+)
+DIST_DEFAULT = {
+    "policy_rate": 0.025, "subsidy_rate": 0.0, "policy_grace": 1, "policy_term": 19,
+    "local_rate": 0.045, "local_term": 10,
+    "om_rate": 0.06, "ins_rate": 0.02, "sys_rate": 0.02, "land_rate": 0.0, "tax_rate": 0.01,
+    "labor_month": 0, "repair_rate": 0.04, "work_cap_months": 3,
+    "legal_reserve": 0.10, "biz_share": 0.6,
+    "degrade": 0.005, "opex_infl": 0.02, "major_year": 12, "major_rate": 0.08,
+}
+DIST_INT = ("policy_loan", "policy_grace", "policy_term", "local_loan", "local_term",
+            "labor_month", "work_cap_months", "major_year")
+
+
+def _pmt(principal: float, rate: float, years: int) -> float:
+    """원리금 균등 연 상환액. 금리 0이면 원금을 기간으로 나눈다(이차보전 전액 보전 시)."""
+    if principal <= 0 or years <= 0:
+        return 0.0
+    if rate <= 0:
+        return principal / years
+    q = (1 + rate) ** years
+    return principal * rate * q / (q - 1)
+
+
+def dist_policy_row(conn, vid) -> dict:
+    r = conn.execute("SELECT * FROM dist_policy WHERE village_id = ?", (vid,)).fetchone()
+    d = dict(DIST_DEFAULT)
+    d["village_id"] = vid
+    d.setdefault("policy_loan", 0)
+    d.setdefault("local_loan", 0)
+    if r:
+        for k in DIST_FIELDS:
+            v = r[k]
+            if v is not None:
+                d[k] = v
+        d["updated_at"] = r["updated_at"]
+    else:
+        # 기초값이 있으면 거기서 끌어온다 — 차입금의 85/15 를 정책융자·신협으로 본다
+        b = conn.execute("SELECT loan_principal, loan_rate FROM fin_base WHERE village_id = ?",
+                         (vid,)).fetchone()
+        if b and b["loan_principal"]:
+            d["policy_loan"] = int(b["loan_principal"])
+            d["policy_rate"] = float(b["loan_rate"] or 0.025)
+        d["updated_at"] = None
+    # 부지가 저수지면 농어촌공사 사용료 매출 5% — 마을이 안 넣었으면 알려만 준다
+    return d
+
+
+def dist_waterfall(revenue: float, p: dict, ctx: dict) -> dict:
+    """한 기간(보통 1년)의 우선순위 배분. 위에서부터 채우고, 채운 만큼만 아래로 내려간다.
+
+    '부족'은 두 가지로 갈라 본다.
+      · 필수부족 — 원리금·운영 실비를 매출로 못 채운 것. 그 해는 밖에서 돈을 꿔 와야 한다 = 부도.
+      · 적립부족 — 수선충당·운전자금을 못 쌓은 것. 당장 안 터지지만 뒤에 터진다.
+    """
+    남 = float(revenue)
+    out = {"매출": round(남)}
+
+    # ① 정책융자 원리금 (이차보전 반영) + 자부담 융자 원리금 — 필수
+    debt = float(ctx.get("debt_service", 0))
+    낸원리금 = min(남, debt)
+    out["①원리금"] = round(낸원리금)
+    out["①부족"] = round(debt - 낸원리금)
+    남 -= 낸원리금
+
+    # ②-a 운영 실비 — 필수
+    실비 = float(ctx.get("opex", 0))
+    낸실비 = min(남, 실비)
+    남 -= 낸실비
+    # ②-b 수선충당 — 권고 적립
+    수선필요 = revenue * float(p["repair_rate"])
+    낸수선 = min(남, 수선필요)
+    남 -= 낸수선
+    # ②-c 운전자금 — 권고 적립
+    운전필요 = float(ctx.get("workcap_need", 0))
+    낸운전 = min(남, 운전필요)
+    남 -= 낸운전
+
+    out["②운영관리비"] = round(낸실비 + 낸수선 + 낸운전)
+    out["②내역"] = {"실비": round(낸실비), "수선충당": round(낸수선), "운전자금적립": round(낸운전)}
+    out["②부족"] = round((실비 - 낸실비) + (수선필요 - 낸수선) + (운전필요 - 낸운전))
+    out["필수부족"] = round((debt - 낸원리금) + (실비 - 낸실비))
+    out["적립부족"] = round((수선필요 - 낸수선) + (운전필요 - 낸운전))
+
+    # ③ 공동사업 · ④ 배당 — 법정적립금을 먼저 떼고 남은 것만
+    법정 = 남 * float(p["legal_reserve"])
+    가용 = max(0.0, 남 - 법정)
+    out["법정적립금"] = round(법정)
+    out["③공동사업"] = round(가용 * float(p["biz_share"]))
+    out["④배당"] = round(가용 - out["③공동사업"])
+    return out
+
+
+def dist_breakeven(p: dict, debt: float, 실비율: float, 실비고정: float) -> float:
+    """필수(원리금 + 운영 실비)를 딱 맞추는 매출. 실비 = 매출×실비율 + 고정비 로 본다."""
+    denom = 1.0 - 실비율
+    if denom <= 0:
+        return float("inf")
+    return (debt + 실비고정) / denom
+
+
+def dist_plan20(conn, vid: int, override: dict | None = None) -> dict:
+    """사업기간(20년) 동안 발전수익만으로 굴러가는지 연도별로 따진다.
+       override 를 주면 그 항목만 바꿔 돌린다(대조안 — 저장하지 않는다)."""
+    p = dist_policy_row(conn, vid)
+    if override:
+        p = dict(p); p.update(override)
+    base = fin_base_row(conn, vid)
+    v = conn.execute("SELECT name, capacity FROM villages WHERE id = ?", (vid,)).fetchone()
+    rows = [dict(r) for r in conn.execute(
+        "SELECT month, revenue, expense FROM coop_monthly WHERE village_id = ? ORDER BY month",
+        (vid,)).fetchall()]
+    실적월 = len([r for r in rows if r["revenue"]])
+    연매출0 = (sum(r["revenue"] for r in rows) / 실적월 * 12) if 실적월 else 0.0
+    # 🔴 실비는 평균이 아니라 **중앙값**으로 연환산한다.
+    #   인버터 교체 같은 일회성 대수선이 한 달 끼면 평균이 통째로 끌려 올라가
+    #   "연 운영비가 매출의 4배" 같은 엉뚱한 계획이 나온다(2026-09-29 강진 사례).
+    #   일회성은 아래 '일회성비용'으로 따로 보여 주고, 계획에는 경상비만 쓴다.
+    월실비 = sorted(float(r["expense"] or 0) for r in rows if r["revenue"])
+    if 월실비:
+        n = len(월실비)
+        중앙 = 월실비[n // 2] if n % 2 else (월실비[n // 2 - 1] + 월실비[n // 2]) / 2
+    else:
+        중앙 = 0.0
+    연실비0 = 중앙 * 12
+    일회성 = max(0.0, sum(월실비) - 중앙 * len(월실비))
+    # 실비가 비어 있으면 요율로 추정한다(운영 전 조합)
+    if 연실비0 <= 0 and 연매출0 > 0:
+        연실비0 = 연매출0 * (p["om_rate"] + p["ins_rate"] + p["sys_rate"] + p["land_rate"] + p["tax_rate"]) \
+                  + p["labor_month"] * 12
+
+    실이율 = max(0.0, float(p["policy_rate"]) - float(p["subsidy_rate"]))
+    pol_pmt = _pmt(float(p["policy_loan"]), 실이율, int(p["policy_term"]))
+    loc_pmt = _pmt(float(p["local_loan"]), float(p["local_rate"]), int(p["local_term"]))
+
+    현금 = 0.0
+    수선적립 = 0.0
+    years, 최저현금, 부도연차, dscr최저 = [], None, None, None
+    누적 = {"매출": 0, "①원리금": 0, "②운영관리비": 0, "③공동사업": 0, "④배당": 0, "법정적립금": 0}
+    for y in range(1, 21):
+        매출 = 연매출0 * ((1 - float(p["degrade"])) ** (y - 1))
+        실비 = 연실비0 * ((1 + float(p["opex_infl"])) ** (y - 1))
+        # 거치기간에는 이자만
+        pol = (float(p["policy_loan"]) * 실이율) if y <= int(p["policy_grace"]) \
+            else (pol_pmt if y <= int(p["policy_grace"]) + int(p["policy_term"]) else 0.0)
+        loc = loc_pmt if y <= int(p["local_term"]) else 0.0
+        debt = pol + loc
+        # 운전자금은 목표(실비 n개월)까지만 쌓는다
+        목표 = 실비 / 12 * int(p["work_cap_months"])
+        운전 = max(0.0, min(목표 - 현금, 매출 * 0.05))
+        w = dist_waterfall(매출, p, {"debt_service": debt, "opex": 실비, "workcap_need": 운전})
+        # 대수선 — 인버터 교체 등. 수선충당에서 먼저 꺼내 쓰고 모자라면 운전자금에서
+        수선적립 += w["②내역"]["수선충당"]
+        대수선 = 0.0
+        부족분 = 0.0
+        if y == int(p["major_year"]):
+            대수선 = float(base["asset_cost"]) * float(p["major_rate"])
+            부족분 = max(0.0, 대수선 - 수선적립)
+            수선적립 = max(0.0, 수선적립 - 대수선)
+        # 실제로 채운 적립만 쌓는다 — 못 채웠는데 잔액이 느는 일이 없게.
+        # 필수부족은 어디선가 꿔 와야 하는 돈이므로 현금에서 그대로 뺀다(구멍이 쌓이는 걸 보여 준다).
+        현금 += w["②내역"]["운전자금적립"] - 부족분 - w["필수부족"]
+        dscr = ((매출 - 실비) / debt) if debt > 0 else None
+        if dscr is not None:
+            dscr최저 = dscr if dscr최저 is None else min(dscr최저, dscr)
+        부도 = (w["필수부족"] > 0) or (현금 < 0)
+        if 부도 and 부도연차 is None:
+            부도연차 = y
+        최저현금 = 현금 if 최저현금 is None else min(최저현금, 현금)
+        for k in 누적:
+            누적[k] += w.get(k, 0)
+        years.append({
+            "연차": y, "매출": round(매출), "원리금": round(debt), "운영실비": round(실비),
+            "①원리금": w["①원리금"], "①부족": w["①부족"],
+            "②운영관리비": w["②운영관리비"], "②부족": w["②부족"],
+            "필수부족": w["필수부족"], "적립부족": w["적립부족"],
+            "수선충당": w["②내역"]["수선충당"], "운전자금적립": w["②내역"]["운전자금적립"],
+            "법정적립금": w["법정적립금"], "③공동사업": w["③공동사업"], "④배당": w["④배당"],
+            "대수선": round(대수선), "수선적립잔액": round(수선적립),
+            "운전자금잔액": round(현금), "DSCR": round(dscr, 2) if dscr is not None else None,
+            "판정": "부도" if 부도 else ("적립부족" if w["적립부족"] > 0 else "정상"),
+        })
+    # 실적이 한 달도 없으면 판정 자체를 내지 않는다 — '부도'가 아니라 '미산출'이다
+    if 실적월 == 0:
+        return {
+            "village_id": vid, "village_name": v["name"] if v else "",
+            "capacity": v["capacity"] if v else "", "policy": p, "실적월": 0,
+            "연매출기준": 0, "연실비기준": 0, "일회성비용": 0,
+            "실부담금리": round(실이율, 5), "정책융자원리금": round(pol_pmt),
+            "자부담융자원리금": round(loc_pmt), "years": [], "누적": {k: 0 for k in 누적},
+            "판정": {"사업기간_운영가능": None, "첫_부도연차": None, "최저_운전자금": 0,
+                     "최저DSCR": None, "손익분기_연매출": None, "현재_연매출": 0,
+                     "감당가능_연원리금": 0, "현재_연원리금": round(pol_pmt + loc_pmt),
+                     "필요_수선충당률": None, "현재_수선충당률": float(p["repair_rate"]),
+                     "말": "월별 실적이 없어 계획을 산출하지 않았습니다."},
+            "대안": [],
+        }
+    가능 = 부도연차 is None
+    # 손익분기 — 필수(원리금+실비)를 맞추는 매출. 실비는 요율분과 고정비(인건비)로 갈라 본다
+    실비율 = float(p["om_rate"]) + float(p["ins_rate"]) + float(p["sys_rate"]) \
+        + float(p["land_rate"]) + float(p["tax_rate"])
+    실비고정 = float(p["labor_month"]) * 12
+    if 연매출0 > 0 and 연실비0 > 0:
+        추정율 = min(0.9, max(0.0, (연실비0 - 실비고정) / 연매출0))
+        실비율 = 추정율 if 추정율 > 0 else 실비율
+    최대원리금 = max(pol_pmt, _pmt(float(p["policy_loan"]), 실이율, int(p["policy_term"])))
+    be = dist_breakeven(p, 최대원리금 + loc_pmt, 실비율, 실비고정)
+    # 대안 셋 — 무엇을 바꾸면 되는지 숫자로
+    대안 = []
+    감당원리금 = max(0.0, 연매출0 * (1 - 실비율) - 실비고정)
+    if not 가능 and 연매출0 > 0:
+        # ㉮ 이차보전 2.5%p
+        r2 = max(0.0, float(p["policy_rate"]) - 0.025)
+        대안.append({"안": "정책융자 이차보전 2.5%p 적용", "원리금": round(_pmt(float(p["policy_loan"]), r2, int(p["policy_term"])) + loc_pmt),
+                     "확정여부": "전남광주 추진 사항 — 확정 아님"})
+        # ㉯ 상환기간 19 → 25년
+        대안.append({"안": "정책융자 상환기간 25년으로 연장", "원리금": round(_pmt(float(p["policy_loan"]), 실이율, 25) + loc_pmt),
+                     "확정여부": "대주 협의 사항"})
+        # ㉰ 이차보전 + 25년
+        대안.append({"안": "이차보전 2.5%p + 상환 25년", "원리금": round(_pmt(float(p["policy_loan"]), r2, 25) + loc_pmt),
+                     "확정여부": "둘 다 필요할 때"})
+        for a in 대안:
+            a["감당가능"] = a["원리금"] <= 감당원리금
+    # 수선충당이 대수선을 감당하는 최소 요율
+    대수선액 = float(base["asset_cost"]) * float(p["major_rate"])
+    누적매출_대수선전 = sum(연매출0 * ((1 - float(p["degrade"])) ** (k - 1))
+                            for k in range(1, int(p["major_year"]) + 1))
+    필요수선율 = (대수선액 / 누적매출_대수선전) if 누적매출_대수선전 > 0 else None
+    return {
+        "village_id": vid, "village_name": v["name"] if v else "", "capacity": v["capacity"] if v else "",
+        "policy": p, "실적월": 실적월, "연매출기준": round(연매출0), "연실비기준": round(연실비0),
+        "일회성비용": round(일회성),
+        "실부담금리": round(실이율, 5), "정책융자원리금": round(pol_pmt), "자부담융자원리금": round(loc_pmt),
+        "years": years, "누적": {k: round(v2) for k, v2 in 누적.items()},
+        "판정": {"사업기간_운영가능": 가능, "첫_부도연차": 부도연차,
+                 "최저_운전자금": round(최저현금 or 0), "최저DSCR": round(dscr최저, 2) if dscr최저 else None,
+                 "손익분기_연매출": round(be), "현재_연매출": round(연매출0),
+                 "감당가능_연원리금": round(감당원리금), "현재_연원리금": round(최대원리금 + loc_pmt),
+                 "필요_수선충당률": round(필요수선율, 4) if 필요수선율 else None,
+                 "현재_수선충당률": float(p["repair_rate"])},
+        "대안": 대안,
+    }
+
+
+def dist_solve(conn, vid: int) -> dict:
+    """사업기간 20년 내내 굴러가게 만드는 **가장 적게 바꾸는** 조합을 찾는다.
+       바꾸는 것은 셋뿐이다 — 이차보전 · 정책융자 상환기간 · 수선충당률.
+       배당을 깎아 맞추는 길은 넣지 않는다. 배당은 이미 맨 뒤라서 남는 게 없으면 저절로 0 이다."""
+    base = dist_plan20(conn, vid)
+    if base["판정"]["사업기간_운영가능"] is None:
+        return {"이미_가능": None, "필요조치": [], "plan": base,
+                "말": "월별 실적이 없어 계획을 세울 수 없습니다."}
+    if base["판정"]["사업기간_운영가능"]:
+        return {"이미_가능": True, "필요조치": [], "plan": base}
+    필요수선 = base["판정"].get("필요_수선충당률")
+    수선안 = []
+    if 필요수선 and 필요수선 > float(base["policy"]["repair_rate"]):
+        수선안 = [round(필요수선 + 0.005, 3)]        # 조금 여유를 둔다
+    후보 = []
+    for sub in (0.0, 0.015, 0.025):                  # 이차보전 0 → 1.5%p → 2.5%p
+        for term in (int(base["policy"]["policy_term"]), 25, 30):
+            for rep in [float(base["policy"]["repair_rate"])] + 수선안:
+                후보.append({"subsidy_rate": sub, "policy_term": term, "repair_rate": rep})
+    # 적게 바꾸는 순서로 — 바꾼 항목 수, 그다음 이차보전 의존도가 낮은 순
+    def 비용(c):
+        n = sum([c["subsidy_rate"] > 0, c["policy_term"] != int(base["policy"]["policy_term"]),
+                 abs(c["repair_rate"] - float(base["policy"]["repair_rate"])) > 1e-9])
+        return (n, c["subsidy_rate"], c["policy_term"])
+    후보.sort(key=비용)
+    for c in 후보:
+        plan = dist_plan20(conn, vid, c)
+        if plan["판정"]["사업기간_운영가능"]:
+            조치 = []
+            if c["subsidy_rate"] > 0:
+                조치.append({"항목": "정책융자 이차보전", "값": "%.1f%%p" % (c["subsidy_rate"] * 100),
+                            "확정여부": "전남광주 추진 사항 — 지자체 확인 필요"})
+            if c["policy_term"] != int(base["policy"]["policy_term"]):
+                조치.append({"항목": "정책융자 상환기간", "값": "%d년" % c["policy_term"],
+                            "확정여부": "대주 협의 사항"})
+            if abs(c["repair_rate"] - float(base["policy"]["repair_rate"])) > 1e-9:
+                조치.append({"항목": "수선충당 요율", "값": "%.1f%%" % (c["repair_rate"] * 100),
+                            "확정여부": "총회 의결로 정할 수 있음"})
+            return {"이미_가능": False, "필요조치": 조치, "적용": c, "plan": plan, "기준안": base["판정"]}
+    return {"이미_가능": False, "필요조치": None, "plan": base, "기준안": base["판정"],
+            "말": "이차보전 2.5%p·상환 30년·수선충당 상향을 다 해도 사업기간을 못 버팁니다. "
+                  "설비 규모나 자부담 비율 자체를 다시 봐야 합니다."}
+
+
+def dist_findings(plan: dict) -> list:
+    out, j, p = [], plan["판정"], plan["policy"]
+    if plan["실적월"] == 0:
+        return [{"급": "mid", "제목": "실적이 없어 계획을 세울 수 없다",
+                 "한줄": "월별 실적이 올라와야 연매출 기준이 잡힙니다.",
+                 "설명": "자료함에 REMS·한전 자료를 올리고 발전·정산 화면에서 제출하세요.", "근거": ["배분"]}]
+    if j["사업기간_운영가능"] is None:
+        return [{"급": "mid", "제목": "계획을 산출하지 않았다", "한줄": "월별 실적이 없습니다.",
+                 "설명": "자료함에 REMS·한전 자료를 올리면 그때부터 20년 계획이 잡힙니다.", "근거": ["배분"]}]
+    if not j["사업기간_운영가능"]:
+        out.append({"급": "high", "제목": "%d년차에 발전수익으로 감당이 안 된다" % j["첫_부도연차"],
+                    "한줄": "그 해에 원리금이나 운영관리비를 매출로 다 못 채웁니다.",
+                    "설명": "이차보전 적용·거치기간 조정·상환기간 연장 가운데 하나가 필요합니다. "
+                            "아래 20년 표에서 그 해 줄을 보고 총회·대주와 협의하세요.", "근거": ["배분", "취소"]})
+    else:
+        out.append({"급": "low", "제목": "사업기간 20년 내내 발전수익으로 감당된다",
+                    "한줄": "최저 DSCR %.2f · 최저 운전자금 %s원." % (j["최저DSCR"] or 0, f"{j['최저_운전자금']:,}"),
+                    "설명": "우선순위대로 채우고 남는 것만 배당으로 갑니다. 이 순서를 총회 의결로 못 박아 두세요.",
+                    "근거": ["배분", "배당"]})
+    if plan.get("일회성비용", 0) > 0:
+        out.append({"급": "low", "제목": "일회성 비용 %s원은 계획에서 뺐다" % f"{plan['일회성비용']:,}",
+                    "한줄": "대수선 같은 일회성 지출을 경상 운영비로 넣으면 계획이 통째로 틀어집니다.",
+                    "설명": "연 운영비는 월별 실비의 **중앙값**으로 잡았습니다. 일회성 지출은 수선충당에서 "
+                            "나가야 할 돈이므로 아래 수선충당 요율 쪽에서 따집니다.", "근거": ["적립"]})
+    if float(p["subsidy_rate"]) <= 0:
+        out.append({"급": "mid", "제목": "이차보전을 안 넣고 계산했다",
+                    "한줄": "정책융자 실부담 금리 %.2f%% 그대로입니다." % (plan["실부담금리"] * 100),
+                    "설명": "전남광주 민심정책은 협동조합 정책자금 2.5% 이차보전을 추진하고 있습니다"
+                            "(확정 아님). 적용되면 원리금이 크게 줄어드니, 확정 여부를 지자체에 확인하고 "
+                            "화면에서 켜 보세요.", "근거": ["배분"]})
+    if j["최저DSCR"] is not None and j["최저DSCR"] < 1.2:
+        out.append({"급": "mid", "제목": "최저 DSCR %.2f" % j["최저DSCR"],
+                    "한줄": "발전량이 나쁜 해가 한 번 오면 바로 빠듯해집니다.",
+                    "설명": "수선충당과 운전자금을 먼저 채우고, 배당은 그 뒤 남는 것으로만 하세요.",
+                    "근거": ["적립", "배당"]})
+    대수선연 = [y for y in plan["years"] if y["대수선"] > 0]
+    if 대수선연 and 대수선연[0]["수선적립잔액"] == 0 and 대수선연[0]["운전자금잔액"] < 0:
+        out.append({"급": "high", "제목": "대수선(%d년차) 재원이 모자란다" % 대수선연[0]["연차"],
+                    "한줄": "인버터 교체 시점에 적립이 바닥납니다.",
+                    "설명": "수선충당 요율을 올리거나 그 전까지 배당을 줄여야 합니다.", "근거": ["검사", "적립"]})
+    return out
+
+
 # ─────────────────── AI (본진 기능 재구현) ───────────────────
 # /api/ai       : Anthropic 메시지 API 프록시(스트리밍 포함). 키만 서버에서 주입.
 # /api/ai/chat  : 관리자 도우미 — history+prompt → {answer}
@@ -3017,3 +3404,131 @@ def consult_one(rid: str, request: Request):
     if u["role"] not in ("admin", "staff", "federation") and r["village_id"] != u["village_id"]:
         return err("forbidden", 403)
     return {"ok": True, "item": _consult_row(r, full=True)}
+
+
+# ── 배분 정책 · 20년 계획 ──
+
+@app.get("/api/my/distpolicy")
+def my_distpolicy(request: Request):
+    u, e = require_member(request)
+    if e:
+        return e
+    if not u["village_id"]:
+        return {"ok": True, "policy": None}
+    with db() as conn:
+        return {"ok": True, "policy": dist_policy_row(conn, u["village_id"])}
+
+
+@app.post("/api/my/distpolicy")
+async def save_my_distpolicy(request: Request):
+    u, e = require_member(request)
+    if e:
+        return e
+    vid = u["village_id"]
+    if not vid:
+        return err("no_village", 400)
+    body = await read_json(request)
+    with db() as conn:
+        cur = dist_policy_row(conn, vid)
+        vals = {}
+        for f in DIST_FIELDS:
+            v = body.get(f, cur.get(f))
+            try:
+                vals[f] = int(float(v or 0)) if f in DIST_INT else float(v or 0)
+            except (TypeError, ValueError):
+                return err("bad_number", 400)
+        cols = ", ".join(DIST_FIELDS)
+        qs = ",".join("?" * len(DIST_FIELDS))
+        sets = ", ".join(f"{f}=excluded.{f}" for f in DIST_FIELDS)
+        conn.execute(
+            f"INSERT INTO dist_policy (village_id, {cols}, updated_at, updated_by)"
+            f" VALUES (?,{qs},?,?)"
+            f" ON CONFLICT(village_id) DO UPDATE SET {sets}, updated_at=excluded.updated_at,"
+            f" updated_by=excluded.updated_by",
+            (vid, *[vals[f] for f in DIST_FIELDS], now_iso(), u["id"]),
+        )
+        return {"ok": True, "policy": dist_policy_row(conn, vid)}
+
+
+@app.get("/api/my/distplan")
+def my_distplan(request: Request, subsidy: str = Query("")):
+    """사업기간 20년 배분 계획. subsidy 를 주면 그 이차보전율로 한 번 더 돌려 비교치를 같이 준다."""
+    u, e = require_member(request)
+    if e:
+        return e
+    if not u["village_id"]:
+        return {"ok": True, "plan": None}
+    with db() as conn:
+        plan = dist_plan20(conn, u["village_id"])
+        out = {"ok": True, "plan": plan, "findings": dist_findings(plan)}
+        # 이차보전을 켠 대조안 — 확정이 아니므로 기본안과 나란히 보여 준다
+        alt_rate = 0.025
+        try:
+            if subsidy:
+                alt_rate = float(subsidy)
+        except ValueError:
+            pass
+        if abs(float(plan["policy"]["subsidy_rate"]) - alt_rate) > 1e-9:
+            alt = dist_plan20(conn, u["village_id"], {"subsidy_rate": alt_rate})
+            out["alt"] = {"subsidy_rate": alt_rate, "판정": alt["판정"], "누적": alt["누적"],
+                          "정책융자원리금": alt["정책융자원리금"], "실부담금리": alt["실부담금리"],
+                          "years": alt["years"]}
+        return out
+
+
+@app.get("/api/my/distsolve")
+def my_distsolve(request: Request):
+    """사업기간 내내 굴러가게 하려면 무엇을 얼마나 바꿔야 하는지 — 가장 적게 바꾸는 조합."""
+    u, e = require_member(request)
+    if e:
+        return e
+    if not u["village_id"]:
+        return {"ok": True, "solve": None}
+    with db() as conn:
+        r = dist_solve(conn, u["village_id"])
+    return {"ok": True, "solve": {k: v for k, v in r.items() if k != "plan"},
+            "plan": r["plan"], "findings": dist_findings(r["plan"])}
+
+
+@app.post("/api/my/distsolve/apply")
+def my_distsolve_apply(request: Request):
+    """해찾기가 낸 조합을 배분 정책으로 저장한다. 사람이 눌러야 반영된다."""
+    u, e = require_member(request)
+    if e:
+        return e
+    if not u["village_id"]:
+        return err("no_village", 400)
+    with db() as conn:
+        r = dist_solve(conn, u["village_id"])
+        c = r.get("적용")
+        if not c:
+            return err("no_solution", 409)
+        cur = dist_policy_row(conn, u["village_id"])
+        cur.update(c)
+        cols = ", ".join(DIST_FIELDS)
+        qs = ",".join("?" * len(DIST_FIELDS))
+        sets = ", ".join(f"{f}=excluded.{f}" for f in DIST_FIELDS)
+        conn.execute(
+            f"INSERT INTO dist_policy (village_id, {cols}, updated_at, updated_by)"
+            f" VALUES (?,{qs},?,?) ON CONFLICT(village_id) DO UPDATE SET {sets},"
+            f" updated_at=excluded.updated_at, updated_by=excluded.updated_by",
+            (u["village_id"], *[cur[f] for f in DIST_FIELDS], now_iso(), u["id"]),
+        )
+        return {"ok": True, "적용": c, "필요조치": r["필요조치"]}
+
+
+@app.get("/api/dist/plans")
+def dist_plans_all(request: Request):
+    """연합회·운영진 — 회원조합 전체의 사업기간 운영가능 여부 한눈에."""
+    u, e = require_fed(request)
+    if e:
+        return e
+    out = []
+    with db() as conn:
+        for r in conn.execute("SELECT id, name, capacity FROM villages ORDER BY name"):
+            plan = dist_plan20(conn, r["id"])
+            out.append({"village_id": r["id"], "village_name": r["name"], "capacity": r["capacity"],
+                        "실적월": plan["실적월"], "연매출기준": plan["연매출기준"],
+                        "실부담금리": plan["실부담금리"], "판정": plan["판정"],
+                        "누적": plan["누적"]})
+    return {"ok": True, "items": out}
