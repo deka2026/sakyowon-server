@@ -1947,12 +1947,21 @@ async def ai_chat(request: Request):
         status, d = await run_in_threadpool(_poome_request, "/api/v1/ask", ask)
         if status != 200 or "answer" not in d:
             return _poome_unavailable_answer(status, d)
+        # 🔴 엔진의 '근거 없음' 판정은 회차마다 흔들린다 — 같은 12문을 3회 재니 26·31·30/36 이었고
+        # 실패하는 문항도 매번 달랐다(2026-09-29 실측). 문장을 다듬는 것으로는 한계라 한 번 더 묻는다.
+        # 두 번 다 물러서면 그때는 진짜로 근거가 없는 것이다.
+        retried = False
+        if d.get("insufficient"):
+            retried = True
+            status2, d2 = await run_in_threadpool(_poome_request, "/api/v1/ask", ask)
+            if status2 == 200 and "answer" in d2 and not d2.get("insufficient"):
+                d = d2
         if d.get("insufficient"):
             return {"answer": "근거 자료에서 답을 찾지 못했습니다. 질문을 바꾸어 보시거나 상담신청을 이용해 주세요.",
-                    "backend": d.get("backend", "poome"), "insufficient": True,
+                    "backend": d.get("backend", "poome"), "insufficient": True, "retried": retried,
                     "sources": d.get("sources", []), "request_id": d.get("request_id")}
         return {"answer": d.get("answer", ""), "backend": d.get("backend", "poome"),
-                "sources": d.get("sources", []), "insufficient": False,
+                "sources": d.get("sources", []), "insufficient": False, "retried": retried,
                 "request_id": d.get("request_id"), "elapsed_ms": d.get("elapsed_ms")}
 
     # ── 기존 Anthropic 경로 (엔진 미설정 시) ──
@@ -2936,12 +2945,13 @@ async def consult_request(request: Request):
     for k in keys:
         q = CONSULT_QUESTIONS[k]
         t0 = time.time()
-        status, d = await run_in_threadpool(
-            _poome_request, "/api/v1/ask",
-            {"question": q, "max_chars": 1200,
-             "context": {"stage": "재무건전성 컨설팅"}}, 120)
-        spent += int((time.time() - t0) * 1000)
+        payload = {"question": q, "max_chars": 1200, "context": {"stage": "재무건전성 컨설팅"}}
+        status, d = await run_in_threadpool(_poome_request, "/api/v1/ask", payload, 120)
         calls += 1
+        if status == 200 and d.get("insufficient"):   # 회차 흔들림 — 한 번 더 (위 주석 참조)
+            status, d = await run_in_threadpool(_poome_request, "/api/v1/ask", payload, 120)
+            calls += 1
+        spent += int((time.time() - t0) * 1000)
         ok = status == 200 and not d.get("insufficient")
         answers.append((q, s(d.get("answer")) or "", ok))
     report = _consult_markdown(title, period, st, findings, answers, scope)
