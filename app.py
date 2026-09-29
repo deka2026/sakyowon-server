@@ -278,6 +278,49 @@ def init_db():
             )
             """
         )
+        # ── 재무제표 기초값 (2026-09-29) ──
+        # 월별 실적만으로는 재무제표를 못 만든다. 설비 취득원가·차입금·출자금 같은
+        # 변하지 않는 기초값을 조합이 한 번 넣어 두면 나머지는 서버가 계산한다.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS fin_base (
+                village_id     INTEGER PRIMARY KEY,
+                asset_cost     INTEGER NOT NULL DEFAULT 0,
+                useful_life    INTEGER NOT NULL DEFAULT 20,
+                loan_principal INTEGER NOT NULL DEFAULT 0,
+                loan_rate      REAL    NOT NULL DEFAULT 0.025,
+                equity         INTEGER NOT NULL DEFAULT 0,
+                opening_cash   INTEGER,
+                note           TEXT,
+                updated_at     TEXT,
+                updated_by     INTEGER
+            )
+            """
+        )
+        # ── 재무건전성 컨설팅 보고서 (상담신청 → GPU 엔진 근거 + 서버 계산) ──
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS consult_reports (
+                id           TEXT PRIMARY KEY,
+                scope        TEXT NOT NULL DEFAULT 'coop',
+                village_id   INTEGER,
+                user_id      INTEGER,
+                title        TEXT,
+                period       TEXT,
+                status       TEXT NOT NULL DEFAULT '접수',
+                ask          TEXT,
+                summary      TEXT,
+                findings     TEXT,
+                report       TEXT,
+                engine       TEXT,
+                engine_calls INTEGER NOT NULL DEFAULT 0,
+                engine_ms    INTEGER NOT NULL DEFAULT 0,
+                created_at   TEXT NOT NULL,
+                done_at      TEXT
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS ix_consult_v ON consult_reports(village_id)")
         # ── 회원조합 지원요청 큐 (연합회 지원업무) ──
         conn.execute(
             """
@@ -1454,6 +1497,249 @@ async def fed_support_save(request: Request):
     return {"ok": True, "id": rid}
 
 
+# ───────── 법인 재무제표 · 재무건전성 컨설팅 (2026-09-29 신설) ─────────
+# 설계 원칙 둘.
+#  ① **금액은 서버가 계산한다.** 손익·재무상태·비율은 전부 결정적 계산이고, 생성형 모델에
+#     숫자를 맡기지 않는다. 틀린 숫자가 든 재무제표는 없느니만 못하다.
+#  ② **제도·법령 근거만 GPU 엔진(넥서스 H200)에 묻는다.** 엔진은 공고·법령 RAG 라서
+#     "이 조합 수치를 봐 달라"에는 물러서지만(실측 0/2), 적립·배당·공시 같은 제도 질문에는
+#     근거를 달아 답한다(실측 2/2). 잘하는 쪽만 시킨다.
+
+FIN_FIELDS = ("asset_cost", "useful_life", "loan_principal", "loan_rate", "equity", "opening_cash")
+
+
+def fin_base_row(conn, vid) -> dict:
+    r = conn.execute("SELECT * FROM fin_base WHERE village_id = ?", (vid,)).fetchone()
+    if r:
+        d = dict(r)
+    else:
+        d = {"village_id": vid, "asset_cost": 0, "useful_life": 20, "loan_principal": 0,
+             "loan_rate": 0.025, "equity": 0, "opening_cash": None, "note": "",
+             "updated_at": None, "updated_by": None}
+    # 기초 대차가 맞아야 재무상태표가 닫힌다: 기초현금 + 설비 = 차입금 + 출자금
+    if d.get("opening_cash") is None:
+        d["opening_cash"] = int(d["loan_principal"] + d["equity"] - d["asset_cost"])
+        d["opening_cash_derived"] = True
+    else:
+        d["opening_cash_derived"] = False
+    return d
+
+
+def coop_statements(conn, vid: int) -> dict:
+    """회원조합 월별 손익계산서 + 월말 재무상태표 + 누적."""
+    base = fin_base_row(conn, vid)
+    rows = [dict(r) for r in conn.execute(
+        "SELECT * FROM coop_monthly WHERE village_id = ? ORDER BY month", (vid,)).fetchall()]
+    dep_m = (base["asset_cost"] / base["useful_life"] / 12) if base["useful_life"] else 0
+    cash = float(base["opening_cash"])
+    loan = float(base["loan_principal"])
+    acc_dep = 0.0
+    unpaid = 0.0          # 미지급이자 — 낸 원리금이 발생이자보다 적으면 여기에 쌓인다
+    acc = {"revenue": 0.0, "opex": 0.0, "dep": 0.0, "interest": 0.0, "profit": 0.0,
+           "principal": 0.0, "debt_service": 0.0, "kwh": 0.0}
+    months = []
+    for r in rows:
+        rev = float(r["revenue"] or 0)
+        opex = float(r["expense"] or 0)
+        ds = float(r["debt"] or 0)                      # 원리금 현금유출 합계
+        # 이자는 발생주의로 전액 잡는다. 낸 돈이 모자라면 깎는 게 아니라 '미지급이자' 부채로 남긴다 —
+        # 깎아 버리면 대차가 안 맞고, 이자도 못 내고 있다는 사실이 화면에서 사라진다(2026-09-29 시험).
+        interest = loan * float(base["loan_rate"]) / 12
+        paid_int = min(ds, interest)
+        principal = ds - paid_int                       # 원금상환은 비용이 아니라 부채 감소다
+        unpaid += interest - paid_int
+        dep = dep_m if base["asset_cost"] else 0.0
+        op = rev - opex - dep
+        net = op - interest
+        cash += rev - opex - ds
+        loan = max(0.0, loan - principal)
+        acc_dep += dep
+        for k, v in (("revenue", rev), ("opex", opex), ("dep", dep), ("interest", interest),
+                     ("profit", net), ("principal", principal), ("debt_service", ds),
+                     ("kwh", float(r["kwh"] or 0))):
+            acc[k] += v
+        equity_total = base["equity"] + (acc["profit"])
+        months.append({
+            "month": r["month"], "kwh": round(float(r["kwh"] or 0)),
+            "매출액": round(rev), "운영비": round(opex), "감가상각비": round(dep),
+            "영업이익": round(op), "이자비용": round(interest), "당기순이익": round(net),
+            "원금상환": round(principal), "원리금": round(ds), "미지급이자": round(unpaid),
+            "현금": round(cash), "유형자산": round(base["asset_cost"] - acc_dep),
+            "자산총계": round(cash + base["asset_cost"] - acc_dep),
+            "차입금": round(loan), "부채총계": round(loan + unpaid), "자본금": base["equity"],
+            "이익잉여금": round(acc["profit"]), "자본총계": round(equity_total),
+            "통장잔액": round(float(r["balance"] or 0)),
+        })
+    # 실적이 한 달도 없으면 기초 상태 그대로가 재무상태표다 — 0 으로 두면 대차가 설비취득가만큼 어긋난다
+    asset_end = cash + base["asset_cost"] - acc_dep
+    cum = {
+        "월수": len(months), "기간": (months[0]["month"] + " ~ " + months[-1]["month"]) if months else "",
+        "발전량": round(acc["kwh"]),
+        "매출액": round(acc["revenue"]), "운영비": round(acc["opex"]),
+        "감가상각비": round(acc["dep"]), "영업이익": round(acc["revenue"] - acc["opex"] - acc["dep"]),
+        "이자비용": round(acc["interest"]), "당기순이익": round(acc["profit"]),
+        "원리금": round(acc["debt_service"]), "원금상환": round(acc["principal"]),
+        "현금": round(cash), "유형자산": round(base["asset_cost"] - acc_dep),
+        "자산총계": round(asset_end), "차입금": round(loan), "미지급이자": round(unpaid),
+        "부채총계": round(loan + unpaid),
+        "자본금": base["equity"], "이익잉여금": round(acc["profit"]),
+        "자본총계": round(base["equity"] + acc["profit"]),
+        "대차차액": round(asset_end - loan - unpaid - base["equity"] - acc["profit"]),
+    }
+    return {"base": base, "months": months, "cumulative": cum}
+
+
+def fed_statements(conn) -> dict:
+    """연합회 자체 법인 재무제표 — 회비·공동사업 수입과 사무국 지출만. 회원 정산금은 안 들어온다."""
+    dues = [dict(r) for r in conn.execute("SELECT month, amount, paid FROM fed_dues").fetchall()]
+    aff = [dict(r) for r in conn.execute(
+        "SELECT kind, date, amount, status FROM fed_affairs").fetchall()]
+    bym: dict = {}
+
+    def cell(m):
+        return bym.setdefault(m, {"month": m, "회비수입": 0, "회비부과": 0,
+                                  "공동사업수입": 0, "사무국비용": 0})
+    for d in dues:
+        c = cell(d["month"]); c["회비수입"] += int(d["paid"] or 0); c["회비부과"] += int(d["amount"] or 0)
+    for a in aff:
+        m = (a["date"] or "")[:7]
+        if len(m) != 7:
+            continue
+        if a["kind"] == "공동사업" and a["status"] == "완료":
+            cell(m)["공동사업수입"] += int(a["amount"] or 0)
+        elif a["kind"] in ("예산", "인사", "결산"):
+            cell(m)["사무국비용"] += int(a["amount"] or 0)
+    months, cash, acc = [], 0.0, {"회비수입": 0, "회비부과": 0, "공동사업수입": 0, "사무국비용": 0}
+    for m in sorted(bym):
+        c = bym[m]
+        net = c["회비수입"] + c["공동사업수입"] - c["사무국비용"]
+        cash += net
+        for k in acc:
+            acc[k] += c[k]
+        months.append({**c, "당기순이익": net, "누적적립금": round(cash)})
+    cum = {**acc, "월수": len(months),
+           "기간": (months[0]["month"] + " ~ " + months[-1]["month"]) if months else "",
+           "수익합계": acc["회비수입"] + acc["공동사업수입"],
+           "당기순이익": acc["회비수입"] + acc["공동사업수입"] - acc["사무국비용"],
+           "미수회비": acc["회비부과"] - acc["회비수입"],
+           "현금": round(cash), "자산총계": round(cash), "부채총계": 0,
+           "자본총계": round(cash)}
+    return {"months": months, "cumulative": cum}
+
+
+# ── 재무건전성 규칙 진단 — 숫자는 여기서만 나온다 ──
+# 각 규칙은 (등급, 제목, 한줄, 근거질문키) 를 낸다. 근거질문키가 엔진에 물을 문항을 고른다.
+
+CONSULT_QUESTIONS = {
+    "적립": "협동조합의 법정적립금은 잉여금의 몇 퍼센트이며 사회적협동조합은 어떻게 다릅니까?",
+    "배당": "협동조합이 잉여금을 조합원에게 배당하려면 어떤 조건을 먼저 충족해야 합니까?",
+    "공시": "협동조합은 경영공시를 언제 어디에 무엇을 공개해야 합니까?",
+    "배분": "햇빛소득마을 사업에서 발전수익은 어떤 용도로 써야 하며 배분 원칙은 무엇입니까?",
+    "검사": "태양광 발전설비와 ESS의 정기검사 주기는 어떻게 됩니까?",
+    "취소": "햇빛소득마을 선정 이후 사업이 취소되는 사유에는 어떤 것이 있습니까?",
+}
+
+
+def coop_findings(st: dict) -> list:
+    c, ms = st["cumulative"], st["months"]
+    out = []
+    if not ms:
+        return [{"급": "high", "제목": "실적 자료 없음", "한줄": "월별 실적이 한 건도 올라오지 않았습니다.",
+                 "설명": "자료함에 REMS·한전·통장 자료를 올리고 발전·정산 화면에서 제출하세요.", "근거": ["취소"]}]
+    rev, opex, dep, ds = c["매출액"], c["운영비"], c["감가상각비"], c["원리금"]
+    op = c["영업이익"]
+    dscr = (op + dep) / ds if ds else None
+    liab, eq = c.get("부채총계", c["차입금"]), c["자본총계"]
+    부채비율 = (liab / eq * 100) if eq > 0 else None
+    영업이익률 = (op / rev * 100) if rev else None
+    월평균운영비 = opex / max(1, c["월수"])
+    현금개월 = (c["현금"] / 월평균운영비) if 월평균운영비 > 0 else None
+
+    if c.get("미지급이자", 0) > 0:
+        out.append({"급": "high", "제목": "이자도 못 내고 있다 (미지급이자 %s원)" % f"{c['미지급이자']:,}",
+                    "한줄": "낸 원리금이 발생이자보다 적어 원금이 한 푼도 줄지 않았습니다.",
+                    "설명": "표준 배분(50/10/20/20)의 융자상환 20%로는 이 차입 조건의 이자를 못 냅니다. "
+                            "배분 비율을 조합 실정에 맞게 총회에서 다시 정하거나, 거치기간·상환방식을 "
+                            "대주와 재협의해야 합니다. 그대로 두면 연체이자가 붙습니다.",
+                    "근거": ["배분", "적립"]})
+    if dscr is not None and dscr < 1.0:
+        out.append({"급": "high", "제목": "상환능력 부족 (DSCR %.2f)" % dscr,
+                    "한줄": "영업현금흐름이 원리금보다 적습니다 — 상환을 자기 돈이 아닌 곳에서 메우고 있습니다.",
+                    "설명": "거치기간 연장·상환방식 변경(5년거치10년 ↔ 1년거치19년)을 대주와 협의하고, "
+                            "운영비 항목별 재검토가 먼저입니다.", "근거": ["취소", "배분"]})
+    elif dscr is not None and dscr < 1.2:
+        out.append({"급": "mid", "제목": "상환능력 여유 부족 (DSCR %.2f)" % dscr,
+                    "한줄": "통상 안전선인 1.2배에 못 미칩니다.",
+                    "설명": "발전량이 나쁜 해가 한 번 오면 바로 마이너스가 됩니다. 수선충당 적립을 먼저 쌓으세요.",
+                    "근거": ["적립"]})
+    if 부채비율 is not None and 부채비율 > 400:
+        out.append({"급": "high", "제목": "부채비율 %.0f%%" % 부채비율,
+                    "한줄": "자본 대비 차입이 지나치게 큽니다.",
+                    "설명": "조기상환 재원을 배당보다 앞세우고, 추가 출자·마을기금 증자를 총회에 올리세요.",
+                    "근거": ["배당"]})
+    elif 부채비율 is not None and 부채비율 > 200:
+        out.append({"급": "mid", "제목": "부채비율 %.0f%%" % 부채비율,
+                    "한줄": "초기 사업으로는 흔하지만 관리 구간입니다.",
+                    "설명": "상환이 진행되면 자연히 낮아집니다. 배당을 늘리기 전에 이 수치를 먼저 보세요.",
+                    "근거": ["배당"]})
+    if 영업이익률 is not None and 영업이익률 < 0:
+        out.append({"급": "high", "제목": "영업손실 (이익률 %.1f%%)" % 영업이익률,
+                    "한줄": "감가상각까지 넣으면 영업이 적자입니다.",
+                    "설명": "일회성 수선비 때문인지 구조적인지 갈라야 합니다. 일회성이면 수선충당 적립으로, "
+                            "구조적이면 운영비 계약(O&M·보험)을 공동구매로 낮추세요.", "근거": ["배분", "검사"]})
+    elif 영업이익률 is not None and 영업이익률 < 10:
+        out.append({"급": "mid", "제목": "영업이익률 %.1f%%" % 영업이익률,
+                    "한줄": "감가상각 반영 후 이익이 얇습니다.",
+                    "설명": "연합회 공동 O&M·공동보험으로 단가를 낮출 수 있는지 먼저 확인하세요.", "근거": ["배분"]})
+    if 현금개월 is not None and 현금개월 < 3:
+        out.append({"급": "high", "제목": "운전자금 %.1f개월분" % 현금개월,
+                    "한줄": "석 달치 운영비도 남아 있지 않습니다.",
+                    "설명": "정산금 입금이 한 달만 밀려도 급여·보험이 막힙니다. 배분 이체를 미루더라도 "
+                            "3~6개월치 운전자금을 먼저 확보하세요.", "근거": ["배분"]})
+    적립률 = None
+    if rev:
+        적립률 = (c["당기순이익"] / rev * 100)
+        if 적립률 < 30:
+            out.append({"급": "mid", "제목": "내부유보 %.1f%% (권고 30~50%%)" % 적립률,
+                        "한줄": "초기 5년은 수익의 30~50%를 쌓아야 6년차 수지 마이너스를 넘깁니다.",
+                        "설명": "행안부 계산으로 연매출 2억 기준 6년차에 약 400만원 마이너스가 납니다. "
+                                "지금 배당을 늘리면 그때 갚을 곳이 없습니다.", "근거": ["적립", "배당"]})
+    if c["월수"] < 8:
+        out.append({"급": "mid", "제목": "제출 월 %d개월" % c["월수"],
+                    "한줄": "기간 중 일부 달의 실적이 비어 있어 추세를 보기 어렵습니다.",
+                    "설명": "빠진 달의 REMS·한전·통장 자료를 올려 주세요. 경영공시 의무와도 이어집니다.",
+                    "근거": ["공시"]})
+    if not out:
+        out.append({"급": "low", "제목": "이상 없음", "한줄": "주요 지표가 모두 안전 구간입니다.",
+                    "설명": "지금 수준을 유지하면서 수선충당·조기상환 우선순위를 총회에서 정해 두세요.",
+                    "근거": ["적립", "배당"]})
+    return out
+
+
+def fed_findings(st: dict) -> list:
+    c = st["cumulative"]
+    out = []
+    수납률 = (c["회비수입"] / c["회비부과"] * 100) if c["회비부과"] else None
+    if 수납률 is not None and 수납률 < 90:
+        out.append({"급": "mid", "제목": "회비 수납률 %.0f%%" % 수납률,
+                    "한줄": "미수 회비 %s원이 남아 있습니다." % f"{c['미수회비']:,}",
+                    "설명": "미수가 쌓이면 사무국 인건비가 먼저 막힙니다. 이사회에 월별 미수 보고를 정례화하세요.",
+                    "근거": ["공시"]})
+    성과배수 = (c["공동사업수입"] / c["회비부과"]) if c["회비부과"] else None
+    if 성과배수 is not None and 성과배수 < 1:
+        out.append({"급": "high", "제목": "공동사업 성과가 회비보다 작다 (%.2f배)" % 성과배수,
+                    "한줄": "회원조합이 낸 돈보다 돌려준 값이 작습니다.",
+                    "설명": "연합회 존재 이유가 흔들립니다. 공동 REC·공동 O&M 협상을 앞당기거나 요율을 낮추세요.",
+                    "근거": ["배분"]})
+    if c["당기순이익"] < 0:
+        out.append({"급": "high", "제목": "연합회 수지 적자",
+                    "한줄": "수입보다 지출이 큽니다.",
+                    "설명": "사무국 규모와 회비 요율을 총회 안건으로 올려야 합니다.", "근거": ["배당", "공시"]})
+    if not out:
+        out.append({"급": "low", "제목": "이상 없음", "한줄": "회비 수납과 공동사업 성과가 모두 양호합니다.",
+                    "설명": "성과를 회비 대비 표로 공개해 다음 총회의 요율 재의결 근거로 두세요.", "근거": ["공시"]})
+    return out
+
 # ─────────────────── AI (본진 기능 재구현) ───────────────────
 # /api/ai       : Anthropic 메시지 API 프록시(스트리밍 포함). 키만 서버에서 주입.
 # /api/ai/chat  : 관리자 도우미 — history+prompt → {answer}
@@ -2452,3 +2738,272 @@ async def docs_kinds():
     """어떤 자료를 자동판독할 수 있는지 — 화면이 미리 물어볼 수 있게."""
     import docs_ingest as _di
     return {"ok": True, "지원": _di.지원유형, "최대바이트": _di.MAX_BYTES}
+
+
+# ── 재무제표 기초값 ──
+
+@app.get("/api/my/finbase")
+def my_finbase(request: Request):
+    u, e = require_member(request)
+    if e:
+        return e
+    if not u["village_id"]:
+        return {"ok": True, "base": None}
+    with db() as conn:
+        return {"ok": True, "base": fin_base_row(conn, u["village_id"])}
+
+
+@app.post("/api/my/finbase")
+async def save_my_finbase(request: Request):
+    u, e = require_member(request)
+    if e:
+        return e
+    vid = u["village_id"]
+    if u["role"] in ("admin", "staff") and request.query_params.get("village_id"):
+        vid = int(request.query_params["village_id"])
+    if not vid:
+        return err("no_village", 400)
+    body = await read_json(request)
+    with db() as conn:
+        cur = fin_base_row(conn, vid)
+        vals = {}
+        for f in FIN_FIELDS:
+            if f in body and body[f] is not None and body[f] != "":
+                try:
+                    vals[f] = float(body[f]) if f == "loan_rate" else int(float(body[f]))
+                except (TypeError, ValueError):
+                    return err("bad_number", 400)
+            else:
+                vals[f] = cur[f] if f != "opening_cash" else (
+                    None if cur.get("opening_cash_derived") else cur["opening_cash"])
+        if not vals.get("useful_life"):
+            vals["useful_life"] = 20
+        conn.execute(
+            "INSERT INTO fin_base (village_id, asset_cost, useful_life, loan_principal, loan_rate,"
+            " equity, opening_cash, note, updated_at, updated_by) VALUES (?,?,?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(village_id) DO UPDATE SET asset_cost=excluded.asset_cost,"
+            " useful_life=excluded.useful_life, loan_principal=excluded.loan_principal,"
+            " loan_rate=excluded.loan_rate, equity=excluded.equity,"
+            " opening_cash=excluded.opening_cash, note=excluded.note,"
+            " updated_at=excluded.updated_at, updated_by=excluded.updated_by",
+            (vid, vals["asset_cost"], vals["useful_life"], vals["loan_principal"],
+             vals["loan_rate"], vals["equity"], vals["opening_cash"], s(body.get("note")),
+             now_iso(), u["id"]),
+        )
+        return {"ok": True, "base": fin_base_row(conn, vid)}
+
+
+# ── 재무제표 ──
+
+@app.get("/api/my/finstat")
+def my_finstat(request: Request):
+    """회원조합은 자기 마을, 연합회는 연합회 자체 법인 재무제표를 본다."""
+    u, e = require_member(request)
+    if e:
+        return e
+    with db() as conn:
+        if u["role"] == "federation":
+            st = fed_statements(conn)
+            return {"ok": True, "scope": "fed", "statements": st, "findings": fed_findings(st)}
+        if not u["village_id"]:
+            return {"ok": True, "scope": "coop", "statements": None, "findings": []}
+        st = coop_statements(conn, u["village_id"])
+        return {"ok": True, "scope": "coop", "village_id": u["village_id"],
+                "statements": st, "findings": coop_findings(st)}
+
+
+@app.get("/api/fin/statements")
+def fin_statements_all(request: Request, village_id: int = Query(0)):
+    """연합회·운영진 — 회원조합 재무제표 열람. village_id 없으면 전 조합 요약."""
+    u, e = require_fed(request)
+    if e:
+        return e
+    with db() as conn:
+        if village_id:
+            st = coop_statements(conn, village_id)
+            return {"ok": True, "village_id": village_id, "statements": st,
+                    "findings": coop_findings(st)}
+        out = []
+        for r in conn.execute("SELECT id, name, capacity, phase FROM villages ORDER BY name"):
+            st = coop_statements(conn, r["id"])
+            f = coop_findings(st)
+            out.append({"village_id": r["id"], "village_name": r["name"], "capacity": r["capacity"],
+                        "phase": r["phase"], "cumulative": st["cumulative"],
+                        "경보": [x for x in f if x["급"] == "high"]})
+        return {"ok": True, "items": out, "fed": fed_statements(conn)}
+
+
+# ── 재무건전성 컨설팅 상담신청 ──
+# 숫자는 위 규칙이 계산하고, 제도·법령 근거만 GPU 엔진에 묻는다.
+
+def _consult_markdown(title, period, st, findings, engine_answers, scope):
+    L = [f"# {title}", "", f"- 대상 기간: {period}", f"- 작성: 햇소자 자동 진단 + GPU 엔진(법령 근거)", ""]
+    c = st["cumulative"]
+    L.append("## 1. 누적 재무 요약")
+    L.append("")
+    if scope == "coop":
+        L += ["| 항목 | 금액(원) |", "|---|---|",
+              f"| 매출액(전력판매) | {c['매출액']:,} |",
+              f"| 운영비 | {c['운영비']:,} |",
+              f"| 감가상각비 | {c['감가상각비']:,} |",
+              f"| 영업이익 | {c['영업이익']:,} |",
+              f"| 이자비용 | {c['이자비용']:,} |",
+              f"| 당기순이익 | {c['당기순이익']:,} |",
+              f"| 원리금 상환(현금) | {c['원리금']:,} |",
+              f"| 기말 현금 | {c['현금']:,} |",
+              f"| 유형자산(장부) | {c['유형자산']:,} |",
+              f"| 차입금 잔액 | {c['차입금']:,} |",
+              f"| 미지급이자 | {c.get('미지급이자', 0):,} |",
+              f"| 자본총계 | {c['자본총계']:,} |"]
+    else:
+        L += ["| 항목 | 금액(원) |", "|---|---|",
+              f"| 회비 수입(수납) | {c['회비수입']:,} |",
+              f"| 회비 부과 | {c['회비부과']:,} |",
+              f"| 미수 회비 | {c['미수회비']:,} |",
+              f"| 공동사업 수입 | {c['공동사업수입']:,} |",
+              f"| 사무국 비용 | {c['사무국비용']:,} |",
+              f"| 당기순이익 | {c['당기순이익']:,} |",
+              f"| 기말 적립금 | {c['현금']:,} |"]
+    L += ["", "## 2. 진단", ""]
+    급 = {"high": "🔴 지금", "mid": "🟠 곧", "low": "🟢 여유"}
+    for f in findings:
+        L.append(f"### {급.get(f['급'], '')} {f['제목']}")
+        L.append("")
+        L.append(f"**{f['한줄']}**")
+        L.append("")
+        L.append(f["설명"])
+        L.append("")
+    L += ["## 3. 제도·법령 근거 (GPU 엔진 답변)", ""]
+    if engine_answers:
+        for q, a, ok in engine_answers:
+            L.append(f"### {q}")
+            L.append("")
+            L.append(a if ok else "_엔진이 근거 문서에서 답을 찾지 못했습니다. 연합회 지원업무로 문의해 주세요._")
+            L.append("")
+    else:
+        L.append("_이번 요청에서는 엔진 근거를 받지 못했습니다._")
+        L.append("")
+    L += ["## 4. 다음 행동", "",
+          "1. 위 🔴 항목을 이사회 안건으로 먼저 올린다.",
+          "2. 적립·배당 결정은 법정적립금을 채운 뒤에 한다(3절 근거 참조).",
+          "3. 빠진 달의 자료를 자료함에 올려 다음 진단의 정확도를 높인다.",
+          "",
+          "> 이 보고서는 조합이 올린 자료로 자동 작성된 것이며, 총회·이사회 의결을 대신하지 않는다.",
+          "> 금액은 서버가 계산했고, 3절의 제도 설명만 GPU 엔진이 작성했다."]
+    return "\n".join(L)
+
+
+@app.post("/api/consult/request")
+async def consult_request(request: Request):
+    """재무건전성 컨설팅 상담신청 — 접수 즉시 진단·엔진 질의를 돌려 보고서를 만든다."""
+    u, e = require_member(request)
+    if e:
+        return e
+    body = await read_json(request)
+    ask = s(body.get("ask")) or "재무제표를 바탕으로 재무건전성을 강화할 방안을 알려 주세요."
+    scope = "fed" if u["role"] == "federation" else "coop"
+    with db() as conn:
+        if scope == "coop":
+            if not u["village_id"]:
+                return err("no_village", 400)
+            v = conn.execute("SELECT name FROM villages WHERE id = ?", (u["village_id"],)).fetchone()
+            name = v["name"] if v else "우리 조합"
+            st = coop_statements(conn, u["village_id"])
+            findings = coop_findings(st)
+        else:
+            name = "햇빛소득마을 연합회"
+            st = fed_statements(conn)
+            findings = fed_findings(st)
+        period = st["cumulative"].get("기간") or "기간 미상"
+        rid = new_id("CNS")
+        title = f"{name} 재무건전성 컨설팅 보고서"
+        conn.execute(
+            "INSERT INTO consult_reports (id, scope, village_id, user_id, title, period, status,"
+            " ask, summary, findings, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (rid, scope, u["village_id"], u["id"], title, period, "작성중", ask,
+             json.dumps(st["cumulative"], ensure_ascii=False),
+             json.dumps(findings, ensure_ascii=False), now_iso()),
+        )
+
+    # 진단이 가리키는 제도 질문만 엔진에 묻는다 (중복 제거, 최대 4문)
+    keys, seen = [], set()
+    for f in findings:
+        for k in f.get("근거", []):
+            if k not in seen:
+                seen.add(k); keys.append(k)
+    keys = keys[:4] or ["적립"]
+    answers, calls, spent = [], 0, 0
+    for k in keys:
+        q = CONSULT_QUESTIONS[k]
+        t0 = time.time()
+        status, d = await run_in_threadpool(
+            _poome_request, "/api/v1/ask",
+            {"question": q, "max_chars": 1200,
+             "context": {"stage": "재무건전성 컨설팅"}}, 120)
+        spent += int((time.time() - t0) * 1000)
+        calls += 1
+        ok = status == 200 and not d.get("insufficient")
+        answers.append((q, s(d.get("answer")) or "", ok))
+    report = _consult_markdown(title, period, st, findings, answers, scope)
+    engine = "poome(exaone-lora)" if POOME_API_BASE else "none"
+    with db() as conn:
+        conn.execute(
+            "UPDATE consult_reports SET status=?, report=?, engine=?, engine_calls=?, engine_ms=?,"
+            " done_at=? WHERE id=?",
+            ("완료", report, engine, calls, spent, now_iso(), rid),
+        )
+    return {"ok": True, "id": rid, "engine": engine, "engine_calls": calls, "engine_ms": spent,
+            "근거확보": sum(1 for _, _, ok in answers if ok), "report": report}
+
+
+def _consult_row(r, full=False) -> dict:
+    d = {k: r[k] for k in ("id", "scope", "village_id", "user_id", "title", "period", "status",
+                           "ask", "engine", "engine_calls", "engine_ms", "created_at", "done_at")}
+    for k in ("summary", "findings"):
+        try:
+            d[k] = json.loads(r[k] or "null")
+        except (ValueError, TypeError):
+            d[k] = None
+    try:
+        d["village_name"] = r["village_name"]
+    except (IndexError, KeyError):
+        pass
+    if full:
+        d["report"] = r["report"] or ""
+    return d
+
+
+@app.get("/api/consult")
+def consult_list(request: Request):
+    """조합은 자기 마을 것, 연합회는 자기가 낸 것, 운영진은 전부."""
+    u, e = require_member(request)
+    if e:
+        return e
+    q = ("SELECT c.*, v.name AS village_name FROM consult_reports c"
+         " LEFT JOIN villages v ON v.id = c.village_id WHERE 1=1")
+    args = []
+    if u["role"] in ("admin", "staff"):
+        pass
+    elif u["role"] == "federation":
+        q += " AND (c.scope = 'fed' OR c.village_id IS NOT NULL)"
+    else:
+        q += " AND c.village_id = ?"; args.append(u["village_id"] or -1)
+    q += " ORDER BY c.created_at DESC"
+    with db() as conn:
+        return {"ok": True, "items": [_consult_row(r) for r in conn.execute(q, args).fetchall()]}
+
+
+@app.get("/api/consult/{rid}")
+def consult_one(rid: str, request: Request):
+    u, e = require_member(request)
+    if e:
+        return e
+    with db() as conn:
+        r = conn.execute(
+            "SELECT c.*, v.name AS village_name FROM consult_reports c"
+            " LEFT JOIN villages v ON v.id = c.village_id WHERE c.id = ?", (rid,)).fetchone()
+    if r is None:
+        return err("not_found", 404)
+    if u["role"] not in ("admin", "staff", "federation") and r["village_id"] != u["village_id"]:
+        return err("forbidden", 403)
+    return {"ok": True, "item": _consult_row(r, full=True)}
