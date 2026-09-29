@@ -214,6 +214,87 @@ def init_db():
             )
             """
         )
+        # ── 회원조합 월별 실적 원장 (2026-09-29 신설) ──
+        # 마을(조합)이 자기 월 실적을 올리고, 연합회·관리자가 전체를 집계해 본다.
+        # 조합원 개인정보는 여기 넣지 않는다 — 금액·발전량 같은 집계값만.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS coop_monthly (
+                id          TEXT PRIMARY KEY,
+                village_id  INTEGER NOT NULL,
+                month       TEXT NOT NULL,
+                kwh         REAL    NOT NULL DEFAULT 0,
+                smp         INTEGER NOT NULL DEFAULT 0,
+                rec         INTEGER NOT NULL DEFAULT 0,
+                revenue     INTEGER NOT NULL DEFAULT 0,
+                expense     INTEGER NOT NULL DEFAULT 0,
+                debt        INTEGER NOT NULL DEFAULT 0,
+                balance     INTEGER NOT NULL DEFAULT 0,
+                dist        TEXT,
+                status      TEXT NOT NULL DEFAULT '마감',
+                detail      TEXT,
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT,
+                created_by  INTEGER,
+                UNIQUE(village_id, month)
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS ix_coop_monthly_m ON coop_monthly(month)")
+        # ── 연합회 회비 부과·수납 (자체 사무) ──
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS fed_dues (
+                id          TEXT PRIMARY KEY,
+                village_id  INTEGER NOT NULL,
+                month       TEXT NOT NULL,
+                base        INTEGER NOT NULL DEFAULT 0,
+                rate        REAL    NOT NULL DEFAULT 0.02,
+                amount      INTEGER NOT NULL DEFAULT 0,
+                paid        INTEGER NOT NULL DEFAULT 0,
+                paid_at     TEXT,
+                memo        TEXT,
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT,
+                UNIQUE(village_id, month)
+            )
+            """
+        )
+        # ── 연합회 자체 사무 기록(총회·이사회·규정·공동사업) ──
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS fed_affairs (
+                id          TEXT PRIMARY KEY,
+                kind        TEXT NOT NULL,
+                title       TEXT NOT NULL,
+                date        TEXT,
+                status      TEXT NOT NULL DEFAULT '예정',
+                owner       TEXT,
+                amount      INTEGER NOT NULL DEFAULT 0,
+                body        TEXT,
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT,
+                created_by  INTEGER
+            )
+            """
+        )
+        # ── 회원조합 지원요청 큐 (연합회 지원업무) ──
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS fed_support (
+                id          TEXT PRIMARY KEY,
+                village_id  INTEGER,
+                user_id     INTEGER,
+                topic       TEXT NOT NULL,
+                detail      TEXT,
+                status      TEXT NOT NULL DEFAULT '접수',
+                assignee    TEXT,
+                reply       TEXT,
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT
+            )
+            """
+        )
         # 기존 테이블 컬럼 보강 (있으면 조용히 통과)
         for table, col, decl in (
             ("feedback", "msg_ko", "TEXT"), ("feedback", "page", "TEXT"),
@@ -556,7 +637,7 @@ async def admin_member_update(member_id: int, request: Request):
     role = s(body.get("role"))
     if status and status not in ("pending", "approved", "rejected"):
         return err("bad_request", 400)
-    if role and role not in ("member", "staff", "admin"):
+    if role and role not in USER_ROLES:
         return err("bad_request", 400)
     if role and u["role"] != "admin":
         return err("forbidden", 403)  # 역할 변경은 이사장(admin)만
@@ -581,6 +662,10 @@ async def admin_member_update(member_id: int, request: Request):
             conn.execute("DELETE FROM sessions WHERE user_id = ?", (member_id,))  # 즉시 접속 차단
     return {"ok": True}
 
+
+# 부여 가능한 등급 — 햇소자 4등급(관리자·연합회·회원협동조합·손님)에 맞춘다.
+# 'member' 는 옛 저장값 호환용으로 남긴다(프런트 normalizeRole 이 coop 으로 읽는다).
+USER_ROLES = ("member", "coop", "federation", "staff", "admin")
 
 FB_STATUSES = ("미확인", "검토중", "반영", "보류")
 
@@ -1039,6 +1124,334 @@ def village_documents(vid: int, request: Request):
             "SELECT * FROM documents WHERE village_id = ? ORDER BY created_at DESC", (vid,)
         ).fetchall()
     return {"ok": True, "items": [dict(r) for r in rows]}
+
+
+# ───────── 회원조합 월별 실적 · 연합회 사무 (2026-09-29 신설) ─────────
+# 갈래를 둘로 나눈다.
+#   ① 협동조합 회원 지원업무 — 회원조합이 올린 월 실적을 연합회가 읽고 지원요청을 처리한다
+#   ② 연합회 자체 사무      — 회비 부과·수납, 총회·이사회, 공동사업 (회원 자료와 섞지 않는다)
+# 개인정보(조합원 명부·주민번호)는 이 경로로 올리지 않는다. 집계 금액·발전량만 받는다.
+
+MONTHLY_NUM = ("kwh", "smp", "rec", "revenue", "expense", "debt", "balance")
+
+
+def require_fed(request: Request):
+    """연합회·운영진 전용. 회원조합(coop)은 자기 것만 보는 /api/my/monthly 를 쓴다."""
+    u = current_user(request)
+    if not u:
+        return None, err("unauthorized", 401)
+    if u["role"] not in ("admin", "staff", "federation"):
+        return None, err("forbidden", 403)
+    return u, None
+
+
+def monthly_row(r) -> dict:
+    d = dict(r)
+    for k in ("dist", "detail"):
+        if d.get(k):
+            try:
+                d[k] = json.loads(d[k])
+            except (ValueError, TypeError):
+                pass
+    return d
+
+
+def _ym_ok(m: str) -> bool:
+    return bool(re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", m or ""))
+
+
+@app.get("/api/my/monthly")
+def my_monthly(request: Request):
+    u, e = require_member(request)
+    if e:
+        return e
+    if not u["village_id"]:
+        return {"ok": True, "items": [], "village_id": None}
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM coop_monthly WHERE village_id = ? ORDER BY month", (u["village_id"],)
+        ).fetchall()
+    return {"ok": True, "village_id": u["village_id"], "items": [monthly_row(r) for r in rows]}
+
+
+@app.post("/api/my/monthly")
+async def save_my_monthly(request: Request):
+    """내 마을의 한 달 실적을 저장·갱신한다. 같은 달을 다시 올리면 덮어쓴다(두 번 잡히지 않게)."""
+    u, e = require_member(request)
+    if e:
+        return e
+    body = await read_json(request)
+    vid = u["village_id"]
+    if u["role"] in ("admin", "staff") and body.get("village_id"):
+        vid = int(body["village_id"])
+    if not vid:
+        return err("no_village", 400)
+    month = s(body.get("month"))
+    if not _ym_ok(month):
+        return err("bad_month", 400)
+    # 몸체에 들어온 칸만 고친다 — 일부만 다시 올렸다고 나머지가 0 으로 지워지면 안 된다.
+    vals = {}
+    for k in MONTHLY_NUM:
+        if k not in body:
+            continue
+        try:
+            vals[k] = float(body[k] or 0) if k == "kwh" else int(float(body[k] or 0))
+        except (TypeError, ValueError):
+            return err("bad_number", 400)
+    rid = f"CM-{vid}-{month}"
+    dist = body.get("dist")
+    detail = body.get("detail")
+    with db() as conn:
+        if conn.execute("SELECT id FROM villages WHERE id = ?", (vid,)).fetchone() is None:
+            return err("not_found", 404)
+        exists = conn.execute(
+            "SELECT id FROM coop_monthly WHERE village_id = ? AND month = ?", (vid, month)
+        ).fetchone()
+        if exists:
+            sets, args = ["updated_at = ?"], [now_iso()]
+            for k, v in vals.items():
+                sets.append(f"{k} = ?"); args.append(v)
+            if dist is not None:
+                sets.append("dist = ?"); args.append(json.dumps(dist, ensure_ascii=False))
+            if detail is not None:
+                sets.append("detail = ?"); args.append(json.dumps(detail, ensure_ascii=False))
+            if body.get("status"):
+                sets.append("status = ?"); args.append(s(body["status"]))
+            args.append(rid)
+            conn.execute(f"UPDATE coop_monthly SET {', '.join(sets)} WHERE id = ?", args)
+        else:
+            g = lambda k: vals.get(k, 0)
+            conn.execute(
+                "INSERT INTO coop_monthly (id, village_id, month, kwh, smp, rec, revenue, expense,"
+                " debt, balance, dist, status, detail, created_at, updated_at, created_by)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (rid, vid, month, g("kwh"), g("smp"), g("rec"), g("revenue"),
+                 g("expense"), g("debt"), g("balance"),
+                 json.dumps(dist, ensure_ascii=False) if dist is not None else None,
+                 s(body.get("status")) or "마감",
+                 json.dumps(detail, ensure_ascii=False) if detail is not None else None,
+                 now_iso(), now_iso(), u["id"]),
+            )
+    return {"ok": True, "id": rid}
+
+
+@app.delete("/api/my/monthly/{month}")
+def delete_my_monthly(month: str, request: Request):
+    u, e = require_member(request)
+    if e:
+        return e
+    if not u["village_id"] or not _ym_ok(month):
+        return err("bad_request", 400)
+    with db() as conn:
+        conn.execute("DELETE FROM coop_monthly WHERE village_id = ? AND month = ?",
+                     (u["village_id"], month))
+    return {"ok": True}
+
+
+@app.get("/api/monthly")
+def all_monthly(request: Request, month: str = Query(""), village_id: int = Query(0)):
+    """연합회·운영진이 회원조합 전체의 월 실적을 읽는다 (지원업무)."""
+    u, e = require_fed(request)
+    if e:
+        return e
+    q = ("SELECT m.*, v.name AS village_name, v.region AS region, v.capacity AS capacity,"
+         " v.phase AS phase, v.ref AS ref FROM coop_monthly m"
+         " JOIN villages v ON v.id = m.village_id WHERE 1=1")
+    args = []
+    if month:
+        q += " AND m.month = ?"; args.append(month)
+    if village_id:
+        q += " AND m.village_id = ?"; args.append(village_id)
+    q += " ORDER BY m.month, v.name"
+    with db() as conn:
+        rows = conn.execute(q, args).fetchall()
+    return {"ok": True, "items": [monthly_row(r) for r in rows]}
+
+
+@app.get("/api/monthly/summary")
+def monthly_summary(request: Request):
+    """마을별 합계와 월별 합계를 한 번에. 연합회 현황판·회비 산정의 기준값이다."""
+    u, e = require_fed(request)
+    if e:
+        return e
+    with db() as conn:
+        by_village = [dict(r) for r in conn.execute(
+            "SELECT v.id AS village_id, v.name AS village_name, v.region, v.capacity, v.phase,"
+            " COUNT(m.id) AS months, COALESCE(SUM(m.kwh),0) AS kwh,"
+            " COALESCE(SUM(m.revenue),0) AS revenue, COALESCE(SUM(m.expense),0) AS expense,"
+            " COALESCE(SUM(m.debt),0) AS debt, MAX(m.month) AS last_month"
+            " FROM villages v LEFT JOIN coop_monthly m ON m.village_id = v.id"
+            " GROUP BY v.id ORDER BY v.name"
+        ).fetchall()]
+        by_month = [dict(r) for r in conn.execute(
+            "SELECT month, COUNT(*) AS villages, SUM(kwh) AS kwh, SUM(revenue) AS revenue,"
+            " SUM(expense) AS expense, SUM(debt) AS debt FROM coop_monthly"
+            " GROUP BY month ORDER BY month"
+        ).fetchall()]
+    return {"ok": True, "by_village": by_village, "by_month": by_month}
+
+
+# ── 연합회 자체 사무: 회비 ──
+
+@app.get("/api/fed/dues")
+def fed_dues_list(request: Request, month: str = Query("")):
+    u, e = require_fed(request)
+    if e:
+        return e
+    q = ("SELECT d.*, v.name AS village_name FROM fed_dues d"
+         " JOIN villages v ON v.id = d.village_id WHERE 1=1")
+    args = []
+    if month:
+        q += " AND d.month = ?"; args.append(month)
+    q += " ORDER BY d.month, v.name"
+    with db() as conn:
+        rows = [dict(r) for r in conn.execute(q, args).fetchall()]
+    return {"ok": True, "items": rows,
+            "부과합계": sum(r["amount"] for r in rows),
+            "수납합계": sum(r["paid"] for r in rows)}
+
+
+@app.post("/api/fed/dues")
+async def fed_dues_save(request: Request):
+    """회비 부과(또는 수납 기록). rate 는 정산금 대비 요율, amount 를 직접 주면 그 값을 쓴다."""
+    u, e = require_fed(request)
+    if e:
+        return e
+    body = await read_json(request)
+    vid = int(body.get("village_id") or 0)
+    month = s(body.get("month"))
+    if not vid or not _ym_ok(month):
+        return err("bad_request", 400)
+    with db() as conn:
+        base = int(float(body.get("base") or 0))
+        if not base:
+            r = conn.execute("SELECT revenue FROM coop_monthly WHERE village_id = ? AND month = ?",
+                             (vid, month)).fetchone()
+            base = int(r["revenue"]) if r else 0
+        rate = float(body.get("rate") if body.get("rate") is not None else 0.02)
+        amount = int(float(body["amount"])) if body.get("amount") is not None else int(round(base * rate))
+        paid = int(float(body.get("paid") or 0))
+        conn.execute(
+            "INSERT INTO fed_dues (id, village_id, month, base, rate, amount, paid, paid_at, memo,"
+            " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(village_id, month) DO UPDATE SET base=excluded.base, rate=excluded.rate,"
+            " amount=excluded.amount, paid=excluded.paid, paid_at=excluded.paid_at,"
+            " memo=excluded.memo, updated_at=excluded.updated_at",
+            (f"FD-{vid}-{month}", vid, month, base, rate, amount, paid,
+             s(body.get("paid_at")) or (now_iso() if paid else None), s(body.get("memo")),
+             now_iso(), now_iso()),
+        )
+    return {"ok": True, "id": f"FD-{vid}-{month}", "base": base, "amount": amount, "paid": paid}
+
+
+# ── 연합회 자체 사무: 총회·이사회·규정·공동사업 ──
+
+FED_KINDS = ("총회", "이사회", "규정", "공동사업", "예산", "결산", "인사", "기타")
+
+
+@app.get("/api/fed/affairs")
+def fed_affairs_list(request: Request, kind: str = Query("")):
+    u, e = require_fed(request)
+    if e:
+        return e
+    q, args = "SELECT * FROM fed_affairs WHERE 1=1", []
+    if kind:
+        q += " AND kind = ?"; args.append(kind)
+    q += " ORDER BY COALESCE(date, created_at) DESC"
+    with db() as conn:
+        return {"ok": True, "items": [dict(r) for r in conn.execute(q, args).fetchall()]}
+
+
+@app.post("/api/fed/affairs")
+async def fed_affairs_save(request: Request):
+    u, e = require_fed(request)
+    if e:
+        return e
+    body = await read_json(request)
+    kind, title = s(body.get("kind")), s(body.get("title"))
+    if kind not in FED_KINDS or not title:
+        return err("bad_request", 400)
+    rid = s(body.get("id")) or new_id("FA")
+    with db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO fed_affairs (id, kind, title, date, status, owner, amount, body,"
+            " created_at, updated_at, created_by) VALUES (?,?,?,?,?,?,?,?,"
+            "COALESCE((SELECT created_at FROM fed_affairs WHERE id = ?), ?),?,?)",
+            (rid, kind, title, s(body.get("date")), s(body.get("status")) or "예정",
+             s(body.get("owner")), int(float(body.get("amount") or 0)), s(body.get("body")),
+             rid, now_iso(), now_iso(), u["id"]),
+        )
+    return {"ok": True, "id": rid}
+
+
+@app.delete("/api/fed/affairs/{rid}")
+def fed_affairs_delete(rid: str, request: Request):
+    u, e = require_fed(request)
+    if e:
+        return e
+    with db() as conn:
+        conn.execute("DELETE FROM fed_affairs WHERE id = ?", (rid,))
+    return {"ok": True}
+
+
+# ── 협동조합 회원 지원업무: 지원요청 큐 ──
+
+@app.get("/api/fed/support")
+def fed_support_list(request: Request, status: str = Query("")):
+    """연합회·운영진은 전체를, 회원조합은 자기 마을 것만 본다."""
+    u, e = require_member(request)
+    if e:
+        return e
+    mine = u["role"] not in ("admin", "staff", "federation")
+    q = ("SELECT sp.*, v.name AS village_name FROM fed_support sp"
+         " LEFT JOIN villages v ON v.id = sp.village_id WHERE 1=1")
+    args = []
+    if mine:
+        q += " AND sp.village_id = ?"; args.append(u["village_id"] or -1)
+    if status:
+        q += " AND sp.status = ?"; args.append(status)
+    q += " ORDER BY sp.created_at DESC"
+    with db() as conn:
+        return {"ok": True, "items": [dict(r) for r in conn.execute(q, args).fetchall()]}
+
+
+@app.post("/api/fed/support")
+async def fed_support_save(request: Request):
+    """회원조합이 지원을 요청하고, 연합회가 상태·회신을 적는다."""
+    u, e = require_member(request)
+    if e:
+        return e
+    body = await read_json(request)
+    rid = s(body.get("id"))
+    is_fed = u["role"] in ("admin", "staff", "federation")
+    with db() as conn:
+        if rid:
+            row = conn.execute("SELECT * FROM fed_support WHERE id = ?", (rid,)).fetchone()
+            if row is None:
+                return err("not_found", 404)
+            if not is_fed and row["village_id"] != u["village_id"]:
+                return err("forbidden", 403)
+            sets, args = ["updated_at = ?"], [now_iso()]
+            fields = ("topic", "detail") if not is_fed else ("topic", "detail", "status", "assignee", "reply")
+            for f in fields:
+                if f in body:
+                    sets.append(f"{f} = ?"); args.append(s(body[f]))
+            args.append(rid)
+            conn.execute(f"UPDATE fed_support SET {', '.join(sets)} WHERE id = ?", args)
+            return {"ok": True, "id": rid}
+        topic = s(body.get("topic"))
+        if not topic:
+            return err("bad_request", 400)
+        rid = new_id("SUP")
+        vid = int(body.get("village_id") or 0) if is_fed else (u["village_id"] or 0)
+        conn.execute(
+            "INSERT INTO fed_support (id, village_id, user_id, topic, detail, status, assignee,"
+            " reply, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (rid, vid or None, u["id"], topic, s(body.get("detail")),
+             s(body.get("status")) or "접수", s(body.get("assignee")), s(body.get("reply")),
+             now_iso(), now_iso()),
+        )
+    return {"ok": True, "id": rid}
 
 
 # ─────────────────── AI (본진 기능 재구현) ───────────────────
