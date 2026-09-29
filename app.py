@@ -1692,9 +1692,10 @@ def coop_findings(st: dict) -> list:
     if c.get("미지급이자", 0) > 0:
         out.append({"급": "high", "제목": "이자도 못 내고 있다 (미지급이자 %s원)" % f"{c['미지급이자']:,}",
                     "한줄": "낸 원리금이 발생이자보다 적어 원금이 한 푼도 줄지 않았습니다.",
-                    "설명": "표준 배분(50/10/20/20)의 융자상환 20%로는 이 차입 조건의 이자를 못 냅니다. "
-                            "배분 비율을 조합 실정에 맞게 총회에서 다시 정하거나, 거치기간·상환방식을 "
-                            "대주와 재협의해야 합니다. 그대로 두면 연체이자가 붙습니다.",
+                    "설명": "지난 기간의 실적입니다 — 표준 배분(50/10/20/20)의 융자상환 20%로는 "
+                            "이 차입 조건의 이자를 못 냅니다. 앞으로는 「수익 배분 계획」의 우선순위 폭포"
+                            "(①원리금이 맨 앞)로 가면 해소됩니다. 이미 쌓인 미지급이자는 별도로 갚을 "
+                            "계획을 총회에 올리세요. 그대로 두면 연체이자가 붙습니다.",
                     "근거": ["배분", "적립"]})
     if dscr is not None and dscr < 1.0:
         out.append({"급": "high", "제목": "상환능력 부족 (DSCR %.2f)" % dscr,
@@ -3232,7 +3233,43 @@ def fin_statements_all(request: Request, village_id: int = Query(0)):
 # ── 재무건전성 컨설팅 상담신청 ──
 # 숫자는 위 규칙이 계산하고, 제도·법령 근거만 GPU 엔진에 묻는다.
 
-def _consult_markdown(title, period, st, findings, engine_answers, scope):
+def _consult_dist_section(plan) -> list:
+    """컨설팅 보고서의 배분 계획 절. 재무제표만 보여 주고 "그래서 어떻게" 를 안 주면 소용이 없다."""
+    if not plan or plan["실적월"] == 0:
+        return ["## 3. 수익 배분 계획", "", "_월별 실적이 없어 배분 계획을 산출하지 않았습니다._", ""]
+    j, p = plan["판정"], plan["policy"]
+    y1 = plan["years"][0] if plan["years"] else {}
+    L = ["## 3. 수익 배분 계획 — 우선순위 폭포", "",
+         "고정 비율(50/10/20/20)을 쓰지 않습니다. 조합마다 융자 조건이 달라 같은 비율로는 "
+         "어떤 조합이 이자도 못 내기 때문입니다. **위에서부터 채우고 남는 것만 아래로** 갑니다.", "",
+         "| 순위 | 1년차 배분액(원) | 무엇인가 |", "|---|---|---|",
+         f"| ① 정책융자 원리금 | {y1.get('①원리금', 0):,} | 이차보전 반영 약정액 — 최우선 |",
+         f"| ② 운영관리비 | {y1.get('②운영관리비', 0):,} | 실비 + 수선충당 + 운전자금 |",
+         f"| ③ 공동사업 | {y1.get('③공동사업', 0):,} | ①② 를 채우고 남은 몫 중 총회가 정한 비율 |",
+         f"| ④ 배당 | {y1.get('④배당', 0):,} | 맨 마지막. 법정적립금을 채운 뒤 |", "",
+         "### 사업기간 20년 판정", ""]
+    if j["사업기간_운영가능"]:
+        L += [f"**발전수익만으로 20년을 버팁니다.** 최저 DSCR {j['최저DSCR']} · "
+              f"최저 운전자금 {j['최저_운전자금']:,}원.", "",
+              f"- 연매출 기준 {j['현재_연매출']:,}원 / 손익분기 {j['손익분기_연매출']:,}원",
+              f"- 실부담 금리 {plan['실부담금리']*100:.2f}% "
+              f"(약정 {float(p['policy_rate'])*100:.2f}% − 이차보전 {float(p['subsidy_rate'])*100:.2f}%p)",
+              f"- 20년 누계 배당 {plan['누적']['④배당']:,}원 · 공동사업 {plan['누적']['③공동사업']:,}원", ""]
+    else:
+        L += [f"**{j['첫_부도연차']}년차부터 발전수익으로 감당이 안 됩니다.**", "",
+              f"- 감당 가능한 연 원리금 {j['감당가능_연원리금']:,}원 / 현재 약정 {j['현재_연원리금']:,}원",
+              f"- 손익분기 연매출 {j['손익분기_연매출']:,}원 / 현재 {j['현재_연매출']:,}원", ""]
+        for a in plan.get("대안", []):
+            L.append(f"- {a['안']} → 연 원리금 {a['원리금']:,}원 "
+                     f"({'감당 가능' if a['감당가능'] else '여전히 부족'}) · {a['확정여부']}")
+        L.append("")
+    if j.get("필요_수선충당률") and j["필요_수선충당률"] > float(p["repair_rate"]):
+        L += [f"> 수선충당 요율이 현재 {float(p['repair_rate'])*100:.1f}% 인데, "
+              f"{int(p['major_year'])}년차 대수선을 감당하려면 **{j['필요_수선충당률']*100:.1f}%** 는 돼야 합니다.", ""]
+    return L
+
+
+def _consult_markdown(title, period, st, findings, engine_answers, scope, plan=None):
     L = [f"# {title}", "", f"- 대상 기간: {period}", f"- 작성: 햇소자 자동 진단 + GPU 엔진(법령 근거)", ""]
     c = st["cumulative"]
     L.append("## 1. 누적 재무 요약")
@@ -3269,7 +3306,11 @@ def _consult_markdown(title, period, st, findings, engine_answers, scope):
         L.append("")
         L.append(f["설명"])
         L.append("")
-    L += ["## 3. 제도·법령 근거 (GPU 엔진 답변)", ""]
+    if scope == "coop":
+        L += _consult_dist_section(plan)
+        L += ["## 4. 제도·법령 근거 (GPU 엔진 답변)", ""]
+    else:
+        L += ["## 3. 제도·법령 근거 (GPU 엔진 답변)", ""]
     if engine_answers:
         for q, a, ok in engine_answers:
             L.append(f"### {q}")
@@ -3279,13 +3320,14 @@ def _consult_markdown(title, period, st, findings, engine_answers, scope):
     else:
         L.append("_이번 요청에서는 엔진 근거를 받지 못했습니다._")
         L.append("")
-    L += ["## 4. 다음 행동", "",
+    L += ["## %d. 다음 행동" % (5 if scope == "coop" else 4), "",
           "1. 위 🔴 항목을 이사회 안건으로 먼저 올린다.",
-          "2. 적립·배당 결정은 법정적립금을 채운 뒤에 한다(3절 근거 참조).",
-          "3. 빠진 달의 자료를 자료함에 올려 다음 진단의 정확도를 높인다.",
+          "2. **배분 순위(①원리금 → ②운영관리비 → ③공동사업 → ④배당)를 총회 의결로 못 박는다.**",
+          "3. 적립·배당 결정은 법정적립금을 채운 뒤에 한다(제도 근거 절 참조).",
+          "4. 빠진 달의 자료를 자료함에 올려 다음 진단의 정확도를 높인다.",
           "",
           "> 이 보고서는 조합이 올린 자료로 자동 작성된 것이며, 총회·이사회 의결을 대신하지 않는다.",
-          "> 금액은 서버가 계산했고, 3절의 제도 설명만 GPU 엔진이 작성했다."]
+          "> **금액과 배분 계획은 서버가 계산했고, 제도 설명만 GPU 엔진이 작성했다.**"]
     return "\n".join(L)
 
 
@@ -3305,10 +3347,12 @@ async def consult_request(request: Request):
             v = conn.execute("SELECT name FROM villages WHERE id = ?", (u["village_id"],)).fetchone()
             name = v["name"] if v else "우리 조합"
             st = coop_statements(conn, u["village_id"])
-            findings = coop_findings(st)
+            plan = dist_plan20(conn, u["village_id"])
+            findings = coop_findings(st) + dist_findings(plan)
         else:
             name = "햇빛소득마을 연합회"
             st = fed_statements(conn)
+            plan = None
             findings = fed_findings(st)
         period = st["cumulative"].get("기간") or "기간 미상"
         rid = new_id("CNS")
@@ -3341,7 +3385,7 @@ async def consult_request(request: Request):
         spent += int((time.time() - t0) * 1000)
         ok = status == 200 and not d.get("insufficient")
         answers.append((q, s(d.get("answer")) or "", ok))
-    report = _consult_markdown(title, period, st, findings, answers, scope)
+    report = _consult_markdown(title, period, st, findings, answers, scope, plan)
     engine = "poome(exaone-lora)" if POOME_API_BASE else "none"
     with db() as conn:
         conn.execute(
