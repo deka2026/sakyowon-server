@@ -5,3 +5,8 @@ data/
 *.db-shm
 .env
 __pycache__/
+*.bak
+*.bak_*
+*.old
+backup/
+*.log

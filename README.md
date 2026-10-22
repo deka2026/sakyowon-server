@@ -13,6 +13,10 @@
 구성 파일: `app.py`(서버) · `requirements.txt` · `sakyowon-api.service`(systemd) ·
 `Caddyfile` · `.env.example`.
 
+> **직원전용 질문·그룹웨어 코드**는 오래 `/opt/sakyowon/` 아래에만 있었다(git 밖).
+> 레포로 회수하고 다시 배포하는 절차는 **[SERVER-CODE.md](SERVER-CODE.md)** 를 본다 —
+> `import-from-server.sh`(서버→레포) · `deploy-server-code.sh`(레포→서버) · `server-files.sh`(대응표).
+
 ---
 
 ## 0. 준비물
